@@ -1,0 +1,74 @@
+{
+  "name": "@divigent/mcp-server",
+  "version": "0.1.0-beta.1",
+  "description": "Model Context Protocol server for Divigent read tools and unsigned transaction planning. Holds no private key and never broadcasts.",
+  "license": "MIT",
+  "author": "Divigent Protocol",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/divigent/divigent-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/divigent/divigent-mcp/issues"
+  },
+  "homepage": "https://github.com/divigent/divigent-mcp#readme",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "divigent-mcp": "dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx src/index.ts",
+    "test": "tsx --test test/security.test.ts",
+    "typecheck": "tsc --noEmit",
+    "typecheck:test": "tsc -p test/tsconfig.json",
+    "clean": "rm -rf dist coverage",
+    "prepublishOnly": "npm run clean && npm run typecheck && npm run typecheck:test && npm run build && npm test"
+  },
+  "dependencies": {
+    "@divigent/sdk": "0.1.0-beta.3",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "viem": "^2.21.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.40",
+    "tsup": "^8.3.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=20.10"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "divigent",
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "defi",
+    "yield",
+    "base",
+    "x402",
+    "claude",
+    "cursor",
+    "read-only",
+    "transaction-planning"
+  ]
+}
