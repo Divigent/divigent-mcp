@@ -1,6 +1,6 @@
 {
   "name": "@divigent/mcp-server",
-  "version": "0.1.0-beta.1",
+  "version": "0.1.0-beta.2",
   "description": "Model Context Protocol server for Divigent read tools and unsigned transaction planning. Holds no private key and never broadcasts.",
   "license": "MIT",
   "author": "Divigent Protocol",
@@ -40,7 +40,7 @@
     "prepublishOnly": "npm run clean && npm run typecheck && npm run typecheck:test && npm run build && npm test"
   },
   "dependencies": {
-    "@divigent/sdk": "0.1.0-beta.3",
+    "@divigent/sdk": "0.1.0-beta.4",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "viem": "^2.21.0",
     "zod": "^3.24.0"

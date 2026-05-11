@@ -47,7 +47,7 @@ test('package metadata is publish-ready and uses the published beta SDK', async 
     license: string;
   };
 
-  assert.equal(packageJson.dependencies['@divigent/sdk'], '0.1.0-beta.3');
+  assert.equal(packageJson.dependencies['@divigent/sdk'], '0.1.0-beta.4');
   assert.ok(!packageJson.dependencies['@divigent/sdk'].startsWith('file:'));
   assert.equal(packageJson.bin['divigent-mcp'], 'dist/index.js');
   assert.ok(packageJson.exports['.']);

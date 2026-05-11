@@ -148,11 +148,19 @@ export const evmAddressField = z
   .regex(/^0x[a-fA-F0-9]{40}$/, 'must be a 0x-prefixed 20-byte hex address')
   .describe('0x-prefixed EVM address.');
 
+function isPositiveUsdcAmount(value: string): boolean {
+  try {
+    return parseUsdc(value) > 0n;
+  } catch {
+    return false;
+  }
+}
+
 export const usdcAmountField = z
   .string()
   .max(40, 'must be 40 characters or fewer')
   .regex(/^\d+(\.\d{1,6})?$/, 'must be a decimal USDC string with max 6 decimals')
-  .refine((value) => parseUsdc(value) > 0n, 'must be greater than 0')
+  .refine(isPositiveUsdcAmount, 'must be greater than 0')
   .describe('USDC amount as a decimal string, e.g. "100.50".');
 
 export const sharesField = z
