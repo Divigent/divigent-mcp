@@ -107,7 +107,27 @@ macOS path:
 }
 ```
 
-Example prompts:
+### Claude Code
+
+From the project where you want Claude Code to use Divigent MCP, run:
+
+```bash
+claude mcp add --transport stdio divigent \
+  --env BASE_SEPOLIA_RPC_URL=https://sepolia.base.org \
+  --env MCP_LOG_LEVEL=error \
+  -- npx -y @divigent/mcp-server@beta
+```
+
+Verify the server is configured:
+
+```bash
+claude mcp list
+claude mcp get divigent
+```
+
+Inside Claude Code, run `/mcp` and confirm `divigent` is connected.
+
+### Example Prompts
 
 ```text
 Use the Divigent MCP server to check Divigent protocol status on Base Sepolia.
@@ -118,7 +138,27 @@ Use Divigent MCP to check current Aave and Morpho yields.
 ```
 
 ```text
-Use Divigent MCP to plan, but not submit, a 1 USDC approval for wallet 0x...
+Use Divigent MCP to get the Divigent position for wallet 0xYourWalletAddress.
+```
+
+```text
+Use Divigent MCP to plan, but not submit, a 1 USDC approval for wallet 0xYourWalletAddress.
+```
+
+```text
+Use Divigent MCP to plan, but not submit, a 1 USDC deposit for wallet 0xYourWalletAddress with 50 bps slippage.
+```
+
+```text
+Use Divigent MCP to plan, but not submit, a withdrawal of 1 USDC for wallet 0xYourWalletAddress.
+```
+
+```text
+Use mcp__divigent__divigent_plan_deposit with wallet 0xYourWalletAddress, amountUsdc 1, and slippageBps 50.
+```
+
+```text
+Use mcp__divigent__divigent_plan_withdraw with wallet 0xYourWalletAddress and shares 1000000.
 ```
 
 ### Cursor
