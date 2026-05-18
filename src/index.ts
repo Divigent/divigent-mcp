@@ -29,23 +29,29 @@ import {
   assertProtocolDeployed,
   evmAddress,
   formatUsdc,
+  getChainConfig,
   parseUsdc,
+  type ChainConfig,
   type DivigentConfig,
+  type DivigentChain,
   type EvmAddress,
 } from '@divigent/sdk';
 import { createPublicClient, encodeFunctionData, http } from 'viem';
 import type { Hex } from 'viem';
-import { baseSepolia } from 'viem/chains';
 import { z } from 'zod';
 
-export const CHAIN = 'base-sepolia' as const;
-export const DEFAULT_RPC_URL = 'https://sepolia.base.org';
+export const SUPPORTED_CHAINS = ['base', 'base-sepolia'] as const satisfies readonly DivigentChain[];
+export const DEFAULT_CHAIN: DivigentChain = 'base';
+export const CHAIN = DEFAULT_CHAIN;
+export const DEFAULT_MAINNET_RPC_URL = 'https://mainnet.base.org';
+export const DEFAULT_SEPOLIA_RPC_URL = 'https://sepolia.base.org';
+export const DEFAULT_RPC_URL = DEFAULT_MAINNET_RPC_URL;
 export const DEFAULT_MAX_PLAN_USDC = '100';
 export const DEFAULT_HTTP_HOST = '127.0.0.1';
 export const DEFAULT_HTTP_PORT = 3000;
 export const MAX_HTTP_BODY_BYTES = 64 * 1024;
 export const TOOL_WARNING =
-  'Unsigned transaction plan only. This MCP server cannot sign or broadcast; review and send from a wallet you control.';
+  'Unsigned transaction plan only. This MCP server cannot sign or broadcast; review chain, contract, calldata, and amounts in a wallet you control before submitting. Base mainnet plans use real funds.';
 export const READ_TOOL_NAMES = [
   'divigent_check_yield',
   'divigent_get_position',
@@ -271,11 +277,54 @@ function maybeAddress(value: unknown): string | undefined {
   return undefined;
 }
 
-export function compactTransactionFromPlan(plan: { request: unknown }): Record<string, unknown> {
+export function isSupportedChain(value: string): value is DivigentChain {
+  return (SUPPORTED_CHAINS as readonly string[]).includes(value);
+}
+
+export function resolveChain(env: NodeJS.ProcessEnv = process.env): DivigentChain {
+  const chain =
+    env.DIVIGENT_CHAIN ??
+    (env.BASE_SEPOLIA_RPC_URL && !env.BASE_MAINNET_RPC_URL && !env.BASE_RPC_URL
+      ? 'base-sepolia'
+      : DEFAULT_CHAIN);
+  if (!isSupportedChain(chain)) {
+    throw new Error(
+      `DIVIGENT_CHAIN must be one of ${SUPPORTED_CHAINS.join(', ')}, got '${chain}'`,
+    );
+  }
+  return chain;
+}
+
+export function resolveRpcUrl(
+  chain: DivigentChain,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (chain === 'base') {
+    return (
+      env.BASE_MAINNET_RPC_URL ??
+      env.BASE_RPC_URL ??
+      env.READ_RPC_URL ??
+      DEFAULT_MAINNET_RPC_URL
+    );
+  }
+
+  return (
+    env.BASE_SEPOLIA_RPC_URL ??
+    env.READ_RPC_URL ??
+    env.BASE_RPC_URL ??
+    DEFAULT_SEPOLIA_RPC_URL
+  );
+}
+
+export function compactTransactionFromPlan(
+  plan: { request: unknown },
+  chain: DivigentChain = DEFAULT_CHAIN,
+): Record<string, unknown> {
   const request = asRecord(plan.request, 'planned request');
   const abi = request.abi;
   const functionName = recordString(request, 'functionName');
   const args = Array.isArray(request.args) ? request.args : [];
+  const chainConfig = getChainConfig(chain);
   const data = encodePlannedFunctionData({
     abi: abi as never,
     functionName,
@@ -283,8 +332,8 @@ export function compactTransactionFromPlan(plan: { request: unknown }): Record<s
   });
 
   const tx: Record<string, unknown> = {
-    chain: CHAIN,
-    chainId: baseSepolia.id,
+    chain,
+    chainId: chainConfig.id,
     to: recordString(request, 'address'),
     data,
     value: request.value ?? '0',
@@ -333,6 +382,9 @@ function loadAddressOverrides(): DivigentConfig['addresses'] | undefined {
 }
 
 type Runtime = {
+  chain: DivigentChain;
+  chainId: number;
+  chainConfig: ChainConfig;
   readRpc: string;
   maxPlanAmount: bigint;
   addresses: DivigentConfig['addresses'] | undefined;
@@ -341,26 +393,18 @@ type Runtime = {
 };
 
 export async function loadRuntime(): Promise<Runtime> {
-  const configuredChain = process.env.DIVIGENT_CHAIN ?? CHAIN;
-  if (configuredChain !== CHAIN) {
-    throw new Error(`DIVIGENT_CHAIN must be '${CHAIN}' for this beta MCP, got '${configuredChain}'`);
-  }
-
-  const readRpc =
-    process.env.BASE_SEPOLIA_RPC_URL ??
-    process.env.READ_RPC_URL ??
-    process.env.BASE_RPC_URL ??
-    DEFAULT_RPC_URL;
-
+  const chain = resolveChain();
+  const chainConfig = getChainConfig(chain);
+  const readRpc = resolveRpcUrl(chain);
   const maxPlanAmount = parseUsdc(process.env.DIVIGENT_MCP_MAX_PLAN_USDC ?? DEFAULT_MAX_PLAN_USDC);
-  const publicClient = createPublicClient({ chain: baseSepolia, transport: http(readRpc) });
+  const publicClient = createPublicClient({ chain: chainConfig.viemChain, transport: http(readRpc) });
   const addresses = loadAddressOverrides();
 
-  if (!addresses) assertProtocolDeployed(CHAIN);
+  if (!addresses) assertProtocolDeployed(chain);
 
   const config: DivigentConfig = {
     publicClient: publicClient as DivigentConfig['publicClient'],
-    chain: CHAIN,
+    chain,
   };
   if (addresses) config.addresses = addresses;
 
@@ -368,11 +412,15 @@ export async function loadRuntime(): Promise<Runtime> {
   await readDivigent.verifyAddresses();
 
   logger.info('divigent MCP runtime initialised', {
-    chain: CHAIN,
+    chain,
+    chainId: chainConfig.id,
     maxPlanUsdc: formatUsdc(maxPlanAmount),
   });
 
   return {
+    chain,
+    chainId: chainConfig.id,
+    chainConfig,
     readRpc,
     maxPlanAmount,
     addresses,
@@ -383,18 +431,19 @@ export async function loadRuntime(): Promise<Runtime> {
 
 export function makePlanningWalletClient(
   wallet: EvmAddress,
+  chain: DivigentChain = DEFAULT_CHAIN,
 ): NonNullable<DivigentConfig['walletClient']> {
   return {
     account: { address: wallet, type: 'json-rpc' },
-    chain: baseSepolia,
+    chain: getChainConfig(chain).viemChain,
   } as unknown as NonNullable<DivigentConfig['walletClient']>;
 }
 
 export function planningDivigent(runtime: Runtime, wallet: EvmAddress): Divigent {
   const config: DivigentConfig = {
     publicClient: runtime.publicClient,
-    walletClient: makePlanningWalletClient(wallet),
-    chain: CHAIN,
+    walletClient: makePlanningWalletClient(wallet, runtime.chain),
+    chain: runtime.chain,
   };
   if (runtime.addresses) config.addresses = runtime.addresses;
   return Divigent.create(config);
@@ -466,7 +515,8 @@ export function buildServer(runtime: Runtime): McpServer {
         divigent.getAllRates(),
       ]);
       return text({
-        chain: CHAIN,
+        chain: runtime.chain,
+        chainId: runtime.chainId,
         optimal: {
           vault: optimal.vault,
           vaultType: optimal.vaultType,
@@ -499,7 +549,8 @@ export function buildServer(runtime: Runtime): McpServer {
         divigent.dvUsdcBalance(wallet),
       ]);
       return text({
-        chain: CHAIN,
+        chain: runtime.chain,
+        chainId: runtime.chainId,
         wallet,
         liquidUsdc: formatUsdc(liquid),
         liquidUsdcAtomic: liquid,
@@ -545,7 +596,8 @@ export function buildServer(runtime: Runtime): McpServer {
       ]);
       const rotationPending = treasuryStatus.pending !== ZERO_ADDRESS;
       return text({
-        chain: CHAIN,
+        chain: runtime.chain,
+        chainId: runtime.chainId,
         addresses: divigent.addresses,
         oracle: {
           fresh: oracleStatus.fresh,
@@ -602,7 +654,8 @@ export function buildServer(runtime: Runtime): McpServer {
       const amount = parseCappedUsdc(args.amountUsdc, runtime);
       const plan = await planningDivigent(runtime, wallet).planApproveUsdc(amount);
       return text({
-        chain: CHAIN,
+        chain: runtime.chain,
+        chainId: runtime.chainId,
         warning: TOOL_WARNING,
         action: 'approveUsdc',
         wallet,
@@ -610,8 +663,13 @@ export function buildServer(runtime: Runtime): McpServer {
         spender: plan.spender,
         amountUsdc: formatUsdc(plan.amount),
         amountUsdcAtomic: plan.amount,
+        approvalAmountUsdc: formatUsdc(plan.approvalAmount),
+        approvalAmountUsdcAtomic: plan.approvalAmount,
         simulationResult: plan.simulationResult,
-        transaction: compactTransactionFromPlan(plan),
+        note: plan.approvalAmount > plan.amount
+          ? 'Approval amount includes a one-atomic-unit USDC buffer from the SDK to avoid exact-allowance deposit edge cases.'
+          : 'Approval amount matches requested amount.',
+        transaction: compactTransactionFromPlan(plan, runtime.chain),
       });
     },
   );
@@ -632,7 +690,8 @@ export function buildServer(runtime: Runtime): McpServer {
         ...(args.slippageBps !== undefined && { slippageBps: args.slippageBps }),
       });
       return text({
-        chain: CHAIN,
+        chain: runtime.chain,
+        chainId: runtime.chainId,
         warning: TOOL_WARNING,
         action: 'deposit',
         wallet,
@@ -651,7 +710,7 @@ export function buildServer(runtime: Runtime): McpServer {
         note: plan.approvalRequired > 0n
           ? 'Deposit was not simulated because current router allowance is insufficient. Call divigent_plan_approve_usdc first.'
           : 'Deposit was simulated successfully at current chain state.',
-        transaction: compactTransactionFromPlan(plan),
+        transaction: compactTransactionFromPlan(plan, runtime.chain),
       });
     },
   );
@@ -688,7 +747,8 @@ export function buildServer(runtime: Runtime): McpServer {
         ...(args.slippageBps !== undefined && { slippageBps: args.slippageBps }),
       });
       return text({
-        chain: CHAIN,
+        chain: runtime.chain,
+        chainId: runtime.chainId,
         warning: TOOL_WARNING,
         action: 'withdraw',
         wallet,
@@ -703,7 +763,7 @@ export function buildServer(runtime: Runtime): McpServer {
         slippageBps: plan.slippageBps,
         simulatedUsdcOut: formatUsdc(plan.simulatedUsdcOut),
         simulatedUsdcOutAtomic: plan.simulatedUsdcOut,
-        transaction: compactTransactionFromPlan(plan),
+        transaction: compactTransactionFromPlan(plan, runtime.chain),
       });
     },
   );

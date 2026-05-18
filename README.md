@@ -1,6 +1,6 @@
 # @divigent/mcp-server
 
-Model Context Protocol server for Divigent on Base Sepolia.
+Model Context Protocol server for Divigent on Base mainnet and Base Sepolia.
 
 The server exposes read tools and unsigned transaction planning tools. It never
 loads a private key, never signs, and never broadcasts. Planning tools use an
@@ -34,23 +34,24 @@ Intentionally not exposed:
 npm install -g @divigent/mcp-server
 ```
 
-This standalone server pins the published beta SDK package that exposes
-unsigned transaction planning APIs.
+This standalone server pins the published Divigent SDK package that exposes
+read APIs and unsigned transaction planning APIs.
 
-For beta testing, use the npm beta tag:
+Run with npx:
 
 ```bash
-npx -y @divigent/mcp-server@beta
+npx -y @divigent/mcp-server
 ```
 
 ## Environment
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `BASE_SEPOLIA_RPC_URL` | `https://sepolia.base.org` | Preferred Base Sepolia RPC URL |
+| `BASE_MAINNET_RPC_URL` | `https://mainnet.base.org` | Preferred Base mainnet RPC URL |
+| `BASE_SEPOLIA_RPC_URL` | `https://sepolia.base.org` | Preferred Base Sepolia RPC URL when `DIVIGENT_CHAIN=base-sepolia` |
 | `READ_RPC_URL` | unset | Fallback RPC URL |
 | `BASE_RPC_URL` | unset | Fallback RPC URL |
-| `DIVIGENT_CHAIN` | `base-sepolia` | Must be `base-sepolia` in this beta |
+| `DIVIGENT_CHAIN` | `base` | `base` or `base-sepolia` |
 | `DIVIGENT_ADDRESSES` | unset | Optional JSON address override |
 | `DIVIGENT_MCP_MAX_PLAN_USDC` | `100` | Per-plan amount cap for approval/deposit/target withdraw |
 | `MCP_TRANSPORT` | `stdio` | `stdio` or `http` |
@@ -79,7 +80,18 @@ Prerequisites:
 
 - Node.js 20 or newer
 - npm/npx available on PATH
-- A Base Sepolia RPC URL; the public default is `https://sepolia.base.org`
+- A Base RPC URL; the public mainnet default is `https://mainnet.base.org`
+
+For mainnet testing, a dedicated or less rate-limited Base RPC provider is
+recommended because the server verifies the configured Divigent contract stack
+on startup.
+
+For Base Sepolia testing, set `DIVIGENT_CHAIN=base-sepolia` and
+`BASE_SEPOLIA_RPC_URL=https://sepolia.base.org`.
+
+Legacy configs that only set `BASE_SEPOLIA_RPC_URL` and do not set
+`DIVIGENT_CHAIN`, `BASE_MAINNET_RPC_URL`, or `BASE_RPC_URL` continue to resolve
+to Base Sepolia.
 
 ### Claude Desktop
 
@@ -97,9 +109,10 @@ macOS path:
   "mcpServers": {
     "divigent": {
       "command": "npx",
-      "args": ["-y", "@divigent/mcp-server@beta"],
+      "args": ["-y", "@divigent/mcp-server"],
       "env": {
-        "BASE_SEPOLIA_RPC_URL": "https://sepolia.base.org",
+        "DIVIGENT_CHAIN": "base",
+        "BASE_MAINNET_RPC_URL": "https://mainnet.base.org",
         "MCP_LOG_LEVEL": "error"
       }
     }
@@ -113,9 +126,10 @@ From the project where you want Claude Code to use Divigent MCP, run:
 
 ```bash
 claude mcp add --transport stdio divigent \
-  --env BASE_SEPOLIA_RPC_URL=https://sepolia.base.org \
+  --env DIVIGENT_CHAIN=base \
+  --env BASE_MAINNET_RPC_URL=https://mainnet.base.org \
   --env MCP_LOG_LEVEL=error \
-  -- npx -y @divigent/mcp-server@beta
+  -- npx -y @divigent/mcp-server
 ```
 
 Verify the server is configured:
@@ -130,7 +144,7 @@ Inside Claude Code, run `/mcp` and confirm `divigent` is connected.
 ### Example Prompts
 
 ```text
-Use the Divigent MCP server to check Divigent protocol status on Base Sepolia.
+Use the Divigent MCP server to check Divigent protocol status on Base.
 ```
 
 ```text
@@ -171,9 +185,10 @@ Add this to your Cursor MCP configuration, then restart Cursor.
     "divigent": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@divigent/mcp-server@beta"],
+      "args": ["-y", "@divigent/mcp-server"],
       "env": {
-        "BASE_SEPOLIA_RPC_URL": "https://sepolia.base.org",
+        "DIVIGENT_CHAIN": "base",
+        "BASE_MAINNET_RPC_URL": "https://mainnet.base.org",
         "MCP_LOG_LEVEL": "error"
       }
     }
@@ -190,9 +205,10 @@ For Codex-style local MCP configuration, use the same stdio command:
   "mcpServers": {
     "divigent": {
       "command": "npx",
-      "args": ["-y", "@divigent/mcp-server@beta"],
+      "args": ["-y", "@divigent/mcp-server"],
       "env": {
-        "BASE_SEPOLIA_RPC_URL": "https://sepolia.base.org",
+        "DIVIGENT_CHAIN": "base",
+        "BASE_MAINNET_RPC_URL": "https://mainnet.base.org",
         "MCP_LOG_LEVEL": "error"
       }
     }
@@ -205,17 +221,19 @@ If your Codex environment uses a TOML MCP config, the equivalent shape is:
 ```toml
 [mcp_servers.divigent]
 command = "npx"
-args = ["-y", "@divigent/mcp-server@beta"]
+args = ["-y", "@divigent/mcp-server"]
 
 [mcp_servers.divigent.env]
-BASE_SEPOLIA_RPC_URL = "https://sepolia.base.org"
+DIVIGENT_CHAIN = "base"
+BASE_MAINNET_RPC_URL = "https://mainnet.base.org"
 MCP_LOG_LEVEL = "error"
 ```
 
 ## HTTP
 
 ```bash
-BASE_SEPOLIA_RPC_URL=https://sepolia.base.org \
+DIVIGENT_CHAIN=base \
+BASE_MAINNET_RPC_URL=https://mainnet.base.org \
 MCP_TRANSPORT=http \
 MCP_HTTP_BEARER_TOKEN="$(openssl rand -hex 32)" \
 npx @divigent/mcp-server
