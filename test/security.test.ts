@@ -28,6 +28,8 @@ import {
   planDepositSchema,
   planWithdrawSchema,
   readJsonBodyWithLimit,
+  resolveChain,
+  resolveRpcUrl,
   statusSchema,
   text,
 } from '../src/index.js';
@@ -37,8 +39,9 @@ const wallet = evmAddress('0x0000000000000000000000000000000000000001');
 const router = '0x0000000000000000000000000000000000000002';
 const spender = '0x0000000000000000000000000000000000000003';
 
-test('package metadata is publish-ready and uses the published beta SDK', async () => {
+test('package metadata is publish-ready and uses the published SDK', async () => {
   const packageJson = JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf8')) as {
+    version: string;
     dependencies: Record<string, string>;
     bin: Record<string, string>;
     exports: Record<string, unknown>;
@@ -47,7 +50,8 @@ test('package metadata is publish-ready and uses the published beta SDK', async 
     license: string;
   };
 
-  assert.equal(packageJson.dependencies['@divigent/sdk'], '0.1.0-beta.4');
+  assert.equal(packageJson.version, '1.0.0');
+  assert.equal(packageJson.dependencies['@divigent/sdk'], '1.0.2');
   assert.ok(!packageJson.dependencies['@divigent/sdk'].startsWith('file:'));
   assert.equal(packageJson.bin['divigent-mcp'], 'dist/index.js');
   assert.ok(packageJson.exports['.']);
@@ -94,6 +98,28 @@ test('USDC planning cap is enforced', () => {
   assert.throws(() => parseCappedUsdc('100.000001', runtime), /planning cap/);
 });
 
+test('chain and RPC configuration support Base mainnet and Base Sepolia', () => {
+  assert.equal(resolveChain({}), 'base');
+  assert.equal(resolveChain({ DIVIGENT_CHAIN: 'base' }), 'base');
+  assert.equal(resolveChain({ DIVIGENT_CHAIN: 'base-sepolia' }), 'base-sepolia');
+  assert.equal(
+    resolveChain({ BASE_SEPOLIA_RPC_URL: 'https://sepolia.example' }),
+    'base-sepolia',
+  );
+  assert.throws(() => resolveChain({ DIVIGENT_CHAIN: 'ethereum' }), /DIVIGENT_CHAIN/);
+
+  assert.equal(resolveRpcUrl('base', {}), 'https://mainnet.base.org');
+  assert.equal(resolveRpcUrl('base-sepolia', {}), 'https://sepolia.base.org');
+  assert.equal(
+    resolveRpcUrl('base', { BASE_MAINNET_RPC_URL: 'https://base.example' }),
+    'https://base.example',
+  );
+  assert.equal(
+    resolveRpcUrl('base-sepolia', { BASE_SEPOLIA_RPC_URL: 'https://sepolia.example' }),
+    'https://sepolia.example',
+  );
+});
+
 test('HTTP bearer auth and unsafe mode behave explicitly', () => {
   assert.throws(() => loadHttpSecurityConfig({}), /requires MCP_HTTP_BEARER_TOKEN/);
 
@@ -137,6 +163,7 @@ test('planning wallet is address-only and cannot sign or write', () => {
   const walletClient = makePlanningWalletClient(wallet) as unknown as Record<string, unknown>;
 
   assert.deepEqual(Object.keys(walletClient).sort(), ['account', 'chain']);
+  assert.equal((walletClient.chain as { id: number }).id, 8453);
   const forbiddenWalletMethods = [
     'transport',
     'request',
@@ -172,7 +199,7 @@ test('structured transaction outputs are JSON-safe and unsigned only', () => {
       account: { address: wallet },
       value: 0n,
     },
-  });
+  }, CHAIN);
   const result = text({ chain: CHAIN, warning: TOOL_WARNING, transaction });
 
   assert.doesNotThrow(() => JSON.stringify(result.structuredContent));
@@ -185,9 +212,33 @@ test('structured transaction outputs are JSON-safe and unsigned only', () => {
   }
   assert.equal(result.structuredContent.warning, TOOL_WARNING);
   assert.equal(structuredTx.chain, CHAIN);
+  assert.equal(structuredTx.chainId, 8453);
   assert.equal(structuredTx.to, router);
   assert.equal(typeof structuredTx.data, 'string');
   assert.ok((structuredTx.data as string).startsWith('0x'));
+
+  const sepoliaTx = compactTransactionFromPlan({
+    request: {
+      address: router,
+      abi: [
+        {
+          type: 'function',
+          name: 'approve',
+          stateMutability: 'nonpayable',
+          inputs: [
+            { name: 'spender', type: 'address' },
+            { name: 'amount', type: 'uint256' },
+          ],
+          outputs: [{ name: '', type: 'bool' }],
+        },
+      ],
+      functionName: 'approve',
+      args: [spender, 123n],
+      value: 0n,
+    },
+  }, 'base-sepolia');
+  assert.equal(sepoliaTx.chain, 'base-sepolia');
+  assert.equal(sepoliaTx.chainId, 84532);
 });
 
 test('no private key env vars or SDK write methods are referenced by exposed server code', async () => {
