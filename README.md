@@ -1,59 +1,52 @@
 # @divigent/mcp-server
 
-Model Context Protocol server for Divigent on Base mainnet and Base Sepolia.
+Read-only Model Context Protocol server for Divigent on Base mainnet.
 
-The server exposes read tools and unsigned transaction planning tools. It never
-loads a private key, never signs, and never broadcasts. Planning tools use an
-address-only wallet-shaped object so the SDK can simulate from the user's
-address and return calldata for an external wallet to review and submit.
+Divigent is the treasury layer for x402 agent wallets. This MCP server helps an
+assistant analyze wallet behavior and missed yield opportunity from public Base
+USDC activity. It does not prepare, sign, broadcast, or execute transactions.
 
 ## Tools
 
 | Tool | Purpose |
 | --- | --- |
-| `divigent_check_yield` | Current Aave/Morpho rates and oracle-selected safe vault |
-| `divigent_get_position` | Wallet USDC, dvUSDC, router allowance, and Divigent position |
-| `divigent_status` | Oracle freshness, treasury, pause flag, TVL, allocation, withdrawal capacity |
-| `divigent_plan_approve_usdc` | Unsigned USDC approval plan for the Divigent router |
-| `divigent_plan_deposit` | Unsigned Divigent deposit plan, with allowance and approval requirement |
-| `divigent_plan_withdraw` | Unsigned Divigent withdrawal plan by shares or desired USDC |
+| `analyze_wallet_behavior` | Analyze Base mainnet USDC balance and payment behavior for a wallet |
+| `analyze_missed_yield` | Estimate idle capital and missed yield opportunity for a wallet |
 
-Intentionally not exposed:
+The server intentionally does not expose:
 
 - private key inputs
 - signing
-- `sendPlan`
-- `deposit`
-- `withdraw`
-- `approveUsdc`
-- governance or pause writes
+- broadcasting
+- transaction preparation
+- calldata
+- `send_calls`
+- protocol rate or vault-recommendation tools
+- deposit, withdraw, recall, sweep, or approval tools
 
 ## Install
+
+Use Node.js 20 or newer.
 
 ```bash
 npm install -g @divigent/mcp-server
 ```
 
-This standalone server pins the published Divigent SDK package that exposes
-read APIs and unsigned transaction planning APIs.
-
-Run with npx:
+Or run with npx:
 
 ```bash
 npx -y @divigent/mcp-server
 ```
+
+The published package depends on `@divigent/sdk@1.0.4`.
 
 ## Environment
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `BASE_MAINNET_RPC_URL` | `https://mainnet.base.org` | Preferred Base mainnet RPC URL |
-| `BASE_SEPOLIA_RPC_URL` | `https://sepolia.base.org` | Preferred Base Sepolia RPC URL when `DIVIGENT_CHAIN=base-sepolia` |
-| `READ_RPC_URL` | unset | Fallback RPC URL |
-| `BASE_RPC_URL` | unset | Fallback RPC URL |
-| `DIVIGENT_CHAIN` | `base` | `base` or `base-sepolia` |
-| `DIVIGENT_ADDRESSES` | unset | Optional JSON address override |
-| `DIVIGENT_MCP_MAX_PLAN_USDC` | `100` | Per-plan amount cap for approval/deposit/target withdraw |
+| `BASE_RPC_URL` | unset | Fallback Base mainnet RPC URL |
+| `DIVIGENT_CHAIN` | unset | Optional compatibility guard; if set, must be `base` |
 | `MCP_TRANSPORT` | `stdio` | `stdio` or `http` |
 | `MCP_LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 
@@ -63,37 +56,70 @@ HTTP-only:
 | --- | --- | --- |
 | `MCP_HOST` | `127.0.0.1` | HTTP bind host |
 | `MCP_PORT` | `3000` | HTTP bind port |
-| `MCP_HTTP_BEARER_TOKEN` | unset | Required for HTTP unless unsafe mode is explicit |
-| `MCP_HTTP_ALLOWED_ORIGINS` | unset | Comma-separated exact browser origins |
-| `MCP_HTTP_UNSAFE_ALLOW_UNAUTHENTICATED` | unset | Local testing escape hatch |
+| `MCP_HTTP_MAX_CONCURRENT_REQUESTS` | `16` | Maximum concurrent authenticated HTTP requests |
+| `MCP_HTTP_BEARER_TOKEN` | unset | Required high-entropy bearer token for HTTP unless unsafe mode is explicit |
+| `MCP_HTTP_ALLOWED_ORIGINS` | unset | Browser CORS allowlist; not an access-control mechanism |
+| `MCP_HTTP_UNSAFE_ALLOW_UNAUTHENTICATED` | unset | Loopback-only local testing escape hatch |
+| `MCP_HTTP_UNSAFE_ALLOW_PUBLIC_UNAUTHENTICATED` | unset | Additional explicit override for public unauthenticated development |
 
-There is intentionally no `AGENT_PK`.
+There is intentionally no private key environment variable.
 
-## Client Setup
+This package is Base mainnet only. It does not infer chain from RPC variables.
+Legacy `DIVIGENT_CHAIN=base-sepolia`, `BASE_SEPOLIA_RPC_URL`, and `READ_RPC_URL`
+settings are rejected at startup so stale testnet configuration cannot silently
+change the chain or RPC endpoint.
 
-Most desktop MCP clients run this server locally over stdio. They start the
-`npx` command below, then communicate with the server over stdin/stdout. You do
-not need to host a public HTTP endpoint for Claude, Cursor, or Codex desktop
-testing.
+## Agent Flow
 
-Prerequisites:
+Base MCP is used separately for wallet discovery. Divigent MCP accepts the
+wallet address and analyzes it.
 
-- Node.js 20 or newer
-- npm/npx available on PATH
-- A Base RPC URL; the public mainnet default is `https://mainnet.base.org`
+```text
+Base MCP get_wallets -> wallet address
+Divigent MCP analyze_wallet_behavior(wallet)
+Divigent MCP analyze_missed_yield(wallet)
+Assistant explains the structured result
+```
 
-For mainnet testing, a dedicated or less rate-limited Base RPC provider is
-recommended because the server verifies the configured Divigent contract stack
-on startup.
+## Claude Code
 
-For Base Sepolia testing, set `DIVIGENT_CHAIN=base-sepolia` and
-`BASE_SEPOLIA_RPC_URL=https://sepolia.base.org`.
+From the project where you want Claude Code to use Divigent MCP, run:
 
-Legacy configs that only set `BASE_SEPOLIA_RPC_URL` and do not set
-`DIVIGENT_CHAIN`, `BASE_MAINNET_RPC_URL`, or `BASE_RPC_URL` continue to resolve
-to Base Sepolia.
+```bash
+claude mcp add --transport stdio divigent \
+  --env BASE_MAINNET_RPC_URL=https://your-premium-base-rpc.example \
+  --env MCP_LOG_LEVEL=error \
+  -- npx -y @divigent/mcp-server
+```
 
-### Claude Desktop
+Verify the server is configured:
+
+```bash
+claude mcp list
+claude mcp get divigent
+```
+
+Inside Claude Code, run `/mcp` and confirm `divigent` is connected.
+
+Example prompts:
+
+```text
+Use Base MCP to get my wallet address, then use Divigent MCP to analyze wallet behavior.
+```
+
+```text
+Use mcp__divigent__analyze_wallet_behavior for wallet 0xYourWalletAddress with lookbackDays 30.
+```
+
+```text
+Use mcp__divigent__analyze_missed_yield for wallet 0xYourWalletAddress with lookbackDays 30 and assumedApy 0.045.
+```
+
+```text
+Using the wallet from Base MCP get_wallets, ask Divigent MCP whether this x402 wallet has idle USDC and summarize the missed yield result.
+```
+
+## Claude Desktop
 
 Add this to `claude_desktop_config.json`, then fully quit and reopen Claude
 Desktop.
@@ -111,8 +137,7 @@ macOS path:
       "command": "npx",
       "args": ["-y", "@divigent/mcp-server"],
       "env": {
-        "DIVIGENT_CHAIN": "base",
-        "BASE_MAINNET_RPC_URL": "https://mainnet.base.org",
+        "BASE_MAINNET_RPC_URL": "https://your-premium-base-rpc.example",
         "MCP_LOG_LEVEL": "error"
       }
     }
@@ -120,62 +145,7 @@ macOS path:
 }
 ```
 
-### Claude Code
-
-From the project where you want Claude Code to use Divigent MCP, run:
-
-```bash
-claude mcp add --transport stdio divigent \
-  --env DIVIGENT_CHAIN=base \
-  --env BASE_MAINNET_RPC_URL=https://mainnet.base.org \
-  --env MCP_LOG_LEVEL=error \
-  -- npx -y @divigent/mcp-server
-```
-
-Verify the server is configured:
-
-```bash
-claude mcp list
-claude mcp get divigent
-```
-
-Inside Claude Code, run `/mcp` and confirm `divigent` is connected.
-
-### Example Prompts
-
-```text
-Use the Divigent MCP server to check Divigent protocol status on Base.
-```
-
-```text
-Use Divigent MCP to check current Aave and Morpho yields.
-```
-
-```text
-Use Divigent MCP to get the Divigent position for wallet 0xYourWalletAddress.
-```
-
-```text
-Use Divigent MCP to plan, but not submit, a 1 USDC approval for wallet 0xYourWalletAddress.
-```
-
-```text
-Use Divigent MCP to plan, but not submit, a 1 USDC deposit for wallet 0xYourWalletAddress with 50 bps slippage.
-```
-
-```text
-Use Divigent MCP to plan, but not submit, a withdrawal of 1 USDC for wallet 0xYourWalletAddress.
-```
-
-```text
-Use mcp__divigent__divigent_plan_deposit with wallet 0xYourWalletAddress, amountUsdc 1, and slippageBps 50.
-```
-
-```text
-Use mcp__divigent__divigent_plan_withdraw with wallet 0xYourWalletAddress and shares 1000000.
-```
-
-### Cursor
+## Cursor
 
 Add this to your Cursor MCP configuration, then restart Cursor.
 
@@ -187,8 +157,7 @@ Add this to your Cursor MCP configuration, then restart Cursor.
       "command": "npx",
       "args": ["-y", "@divigent/mcp-server"],
       "env": {
-        "DIVIGENT_CHAIN": "base",
-        "BASE_MAINNET_RPC_URL": "https://mainnet.base.org",
+        "BASE_MAINNET_RPC_URL": "https://your-premium-base-rpc.example",
         "MCP_LOG_LEVEL": "error"
       }
     }
@@ -196,9 +165,9 @@ Add this to your Cursor MCP configuration, then restart Cursor.
 }
 ```
 
-### Codex
+## Codex
 
-For Codex-style local MCP configuration, use the same stdio command:
+Use the same stdio command in your local MCP config:
 
 ```json
 {
@@ -207,8 +176,7 @@ For Codex-style local MCP configuration, use the same stdio command:
       "command": "npx",
       "args": ["-y", "@divigent/mcp-server"],
       "env": {
-        "DIVIGENT_CHAIN": "base",
-        "BASE_MAINNET_RPC_URL": "https://mainnet.base.org",
+        "BASE_MAINNET_RPC_URL": "https://your-premium-base-rpc.example",
         "MCP_LOG_LEVEL": "error"
       }
     }
@@ -216,7 +184,7 @@ For Codex-style local MCP configuration, use the same stdio command:
 }
 ```
 
-If your Codex environment uses a TOML MCP config, the equivalent shape is:
+If your Codex environment uses a TOML MCP config:
 
 ```toml
 [mcp_servers.divigent]
@@ -224,62 +192,68 @@ command = "npx"
 args = ["-y", "@divigent/mcp-server"]
 
 [mcp_servers.divigent.env]
-DIVIGENT_CHAIN = "base"
-BASE_MAINNET_RPC_URL = "https://mainnet.base.org"
+BASE_MAINNET_RPC_URL = "https://your-premium-base-rpc.example"
 MCP_LOG_LEVEL = "error"
 ```
 
 ## HTTP
 
+HTTP is intended for controlled local or internal deployments. It binds to
+`127.0.0.1` by default and requires bearer auth unless unsafe mode is explicitly
+set. The unauthenticated testing escape hatch is rejected when `MCP_HOST` is not
+loopback unless `MCP_HTTP_UNSAFE_ALLOW_PUBLIC_UNAUTHENTICATED=true` is also set.
+
 ```bash
-DIVIGENT_CHAIN=base \
-BASE_MAINNET_RPC_URL=https://mainnet.base.org \
+BASE_MAINNET_RPC_URL=https://your-premium-base-rpc.example \
 MCP_TRANSPORT=http \
 MCP_HTTP_BEARER_TOKEN="$(openssl rand -hex 32)" \
 npx @divigent/mcp-server
 ```
 
+`MCP_HTTP_BEARER_TOKEN` must be a generated secret with at least 32
+non-whitespace characters and enough estimated entropy. Placeholder values such
+as `test-token`, `password`, or repeated patterns are rejected at startup.
+
+`MCP_HTTP_ALLOWED_ORIGINS` only controls browser CORS checks. It does not
+restrict non-browser MCP clients, `curl`, scripts, servers, or desktop clients,
+which commonly omit the `Origin` header. Use bearer auth and network controls
+for access control.
+
 The server exposes `POST /` and `POST /mcp` for stateless Streamable HTTP and
-`GET /healthz` for liveness. HTTP binds to `127.0.0.1` by default, all routes
-require bearer auth unless unsafe mode is explicitly set, and JSON request
-bodies are capped at 64 KiB. Put remote deployments behind TLS.
-
-## Address Overrides
-
-If using a private deployment, set `DIVIGENT_ADDRESSES` to a JSON file:
-
-```json
-{
-  "router": "0x...",
-  "oracle": "0x...",
-  "feeCollector": "0x...",
-  "dvUsdc": "0x...",
-  "usdc": "0x...",
-  "aavePool": "0x...",
-  "aToken": "0x...",
-  "steakhouseUSDCPrimeVault": "0x..."
-}
-```
-
-The server verifies the configured contract stack at startup.
+`GET /healthz` for liveness. Browser origins are denied unless explicitly
+allowlisted, JSON request bodies are capped at 64 KiB, and authenticated POST
+work is bounded by `MCP_HTTP_MAX_CONCURRENT_REQUESTS`. Requests above that
+process limit receive `503 server busy`; put remote deployments behind TLS and
+reverse-proxy rate limiting.
 
 ## Development
 
 ```bash
 npm install
 npm run typecheck
+npm run typecheck:test
 npm run build
 npm test
+npm audit --audit-level=high
+npm pack --dry-run
 ```
 
 ## Security Model
 
+- Base mainnet only, chainId `8453`.
+- No chain auto-inference; stale Sepolia or legacy chain/RPC variables fail startup.
 - No private key is read from environment or disk.
-- No MCP tool calls SDK broadcast methods.
-- Planning tools return unsigned calldata and metadata only.
+- No wallet client is created.
+- No transaction planning, agent-controlled slippage, or calldata is returned.
+- No MCP tool calls SDK write, planning, signing, or broadcast methods.
+- Numeric USDC values are returned as strings from the SDK report.
 - HTTP transport requires bearer auth by default.
-- Browser origins are denied unless explicitly allowlisted.
+- HTTP bearer tokens must be generated high-entropy secrets.
+- Unauthenticated HTTP mode is loopback-only unless a separate public unsafe override is set.
+- Browser origins are denied unless explicitly allowlisted; absent `Origin` headers from non-browser clients are not blocked by CORS.
+- `MCP_HTTP_ALLOWED_ORIGINS` is browser CORS policy only and does not replace bearer auth, firewalling, or reverse-proxy access control.
 - HTTP JSON request bodies are capped at 64 KiB.
+- HTTP POST handling uses a bounded prebuilt MCP server pool and returns 503 when saturated.
 - All diagnostics go to stderr so stdio JSON-RPC stdout remains clean.
 
 ## License

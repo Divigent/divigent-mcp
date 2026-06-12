@@ -1,14 +1,12 @@
 /**
- * @notice Divigent MCP server - read tools + unsigned transaction planning.
+ * @notice Divigent MCP server - read-only wallet analysis for Base agent wallets.
  *
- * Single-file implementation. The server has NO private key and exposes NO
- * tool that signs, sends, or broadcasts a transaction. Planning tools pass a
- * wallet-shaped address object into the SDK so viem can simulate calls from the
- * user's address, then return unsigned calldata for an external wallet to
- * review and submit.
+ * The server has no private key, no wallet client, and no transaction execution
+ * surface. Tools analyze wallet behavior and missed yield opportunity using
+ * public Base mainnet data only.
  *
  * Transports:
- *   - stdio (default) - Claude Desktop, Cursor, MCP Inspector
+ *   - stdio (default) - Claude Desktop, Claude Code, Cursor, MCP Inspector
  *   - http - stateless Streamable HTTP (port from MCP_PORT, default 3000)
  *
  * All diagnostic logging goes to stderr. stdout is reserved for the JSON-RPC
@@ -16,58 +14,39 @@
  */
 
 import { timingSafeEqual } from 'crypto';
-import { readFileSync, realpathSync } from 'fs';
+import { realpathSync } from 'fs';
 import type { IncomingMessage } from 'http';
+import { isIP } from 'net';
 import { resolve } from 'path';
 import { fileURLToPath } from 'url';
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
-  Divigent,
-  ZERO_ADDRESS,
+  analyzeMissedYield,
+  analyzeWalletBehavior,
   assertProtocolDeployed,
   evmAddress,
-  formatUsdc,
-  getChainConfig,
-  parseUsdc,
-  type ChainConfig,
-  type DivigentConfig,
-  type DivigentChain,
+  type AnalyzeMissedYieldInput,
+  type AnalyzeWalletBehaviorInput,
   type EvmAddress,
 } from '@divigent/sdk';
-import { createPublicClient, encodeFunctionData, http } from 'viem';
-import type { Hex } from 'viem';
 import { z } from 'zod';
 
-export const SUPPORTED_CHAINS = ['base', 'base-sepolia'] as const satisfies readonly DivigentChain[];
-export const DEFAULT_CHAIN: DivigentChain = 'base';
-export const CHAIN = DEFAULT_CHAIN;
+export const CHAIN = 'base' as const;
+export const CHAIN_ID = 8453 as const;
 export const DEFAULT_MAINNET_RPC_URL = 'https://mainnet.base.org';
-export const DEFAULT_SEPOLIA_RPC_URL = 'https://sepolia.base.org';
-export const DEFAULT_RPC_URL = DEFAULT_MAINNET_RPC_URL;
-export const DEFAULT_MAX_PLAN_USDC = '100';
 export const DEFAULT_HTTP_HOST = '127.0.0.1';
 export const DEFAULT_HTTP_PORT = 3000;
+export const DEFAULT_HTTP_MAX_CONCURRENT_REQUESTS = 16;
+export const MAX_HTTP_MAX_CONCURRENT_REQUESTS = 256;
+export const MIN_HTTP_BEARER_TOKEN_LENGTH = 32;
+export const MIN_HTTP_BEARER_TOKEN_SHANNON_BITS = 128;
 export const MAX_HTTP_BODY_BYTES = 64 * 1024;
-export const TOOL_WARNING =
-  'Unsigned transaction plan only. This MCP server cannot sign or broadcast; review chain, contract, calldata, and amounts in a wallet you control before submitting. Base mainnet plans use real funds.';
-export const READ_TOOL_NAMES = [
-  'divigent_check_yield',
-  'divigent_get_position',
-  'divigent_status',
-] as const;
-export const PLANNING_TOOL_NAMES = [
-  'divigent_plan_approve_usdc',
-  'divigent_plan_deposit',
-  'divigent_plan_withdraw',
-] as const;
-export const TOOL_NAMES = [...READ_TOOL_NAMES, ...PLANNING_TOOL_NAMES] as const;
-const encodePlannedFunctionData = encodeFunctionData as unknown as (parameters: {
-  abi: unknown;
-  functionName: string;
-  args: readonly unknown[];
-}) => Hex;
+export const TOOL_NAMES = ['analyze_wallet_behavior', 'analyze_missed_yield'] as const;
+export const SERVER_VERSION = '1.0.1';
+export const SAFE_TOOL_ERROR_MESSAGE =
+  'Divigent MCP tool failed while reading Base mainnet data. Error details were redacted; check MCP server logs.';
 
 const LEVELS = ['trace', 'debug', 'info', 'warn', 'error'] as const;
 type LogLevel = (typeof LEVELS)[number];
@@ -102,12 +81,77 @@ const logger = {
 type HttpSecurityConfig = {
   bearerToken: string | undefined;
   unsafeAllowUnauthenticated: boolean;
+  unsafeAllowPublicUnauthenticated: boolean;
   allowedOrigins: ReadonlySet<string>;
 };
 
-export function loadHttpSecurityConfig(env: NodeJS.ProcessEnv = process.env): HttpSecurityConfig {
+export function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase().replace(/^\[(.*)\]$/, '$1');
+  if (normalized === 'localhost' || normalized === '::1') return true;
+  if (isIP(normalized) !== 4) return false;
+  return normalized.split('.')[0] === '127';
+}
+
+function shannonEntropyBits(value: string): number {
+  const counts = new Map<string, number>();
+  for (const char of value) counts.set(char, (counts.get(char) ?? 0) + 1);
+
+  let entropyPerChar = 0;
+  for (const count of counts.values()) {
+    const probability = count / value.length;
+    entropyPerChar -= probability * Math.log2(probability);
+  }
+  return entropyPerChar * value.length;
+}
+
+function isRepeatedPattern(value: string): boolean {
+  for (let size = 1; size <= Math.floor(value.length / 2); size += 1) {
+    if (value.length % size !== 0) continue;
+    const pattern = value.slice(0, size);
+    if (pattern.repeat(value.length / size) === value) return true;
+  }
+  return false;
+}
+
+export function validateHttpBearerToken(token: string): void {
+  const weakTokenMessage =
+    'MCP_HTTP_BEARER_TOKEN must be a generated high-entropy secret: at least 32 non-whitespace characters, not a placeholder, and estimated entropy >= 128 bits. Generate one with: openssl rand -hex 32';
+  const normalized = token.toLowerCase();
+  const placeholderTerms = [
+    'admin',
+    'bearer',
+    'changeme',
+    'change-me',
+    'default',
+    'divigent',
+    'example',
+    'password',
+    'placeholder',
+    'secret',
+    'test',
+    'token',
+  ];
+
+  if (
+    token.length < MIN_HTTP_BEARER_TOKEN_LENGTH ||
+    token.trim() !== token ||
+    /\s/.test(token) ||
+    isRepeatedPattern(token) ||
+    placeholderTerms.some((term) => normalized.includes(term)) ||
+    shannonEntropyBits(token) < MIN_HTTP_BEARER_TOKEN_SHANNON_BITS
+  ) {
+    throw new Error(weakTokenMessage);
+  }
+}
+
+export function loadHttpSecurityConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  host = env.MCP_HOST ?? DEFAULT_HTTP_HOST,
+): HttpSecurityConfig {
   const bearerToken = env.MCP_HTTP_BEARER_TOKEN;
   const unsafeAllowUnauthenticated = env.MCP_HTTP_UNSAFE_ALLOW_UNAUTHENTICATED === 'true';
+  const unsafeAllowPublicUnauthenticated =
+    env.MCP_HTTP_UNSAFE_ALLOW_PUBLIC_UNAUTHENTICATED === 'true';
   const allowedOrigins = new Set(
     (env.MCP_HTTP_ALLOWED_ORIGINS ?? '')
       .split(',')
@@ -120,8 +164,25 @@ export function loadHttpSecurityConfig(env: NodeJS.ProcessEnv = process.env): Ht
       'HTTP transport requires MCP_HTTP_BEARER_TOKEN. For local-only testing, set MCP_HTTP_UNSAFE_ALLOW_UNAUTHENTICATED=true explicitly.',
     );
   }
+  if (bearerToken) validateHttpBearerToken(bearerToken);
 
-  return { bearerToken, unsafeAllowUnauthenticated, allowedOrigins };
+  if (
+    !bearerToken &&
+    unsafeAllowUnauthenticated &&
+    !isLoopbackHost(host) &&
+    !unsafeAllowPublicUnauthenticated
+  ) {
+    throw new Error(
+      'Unauthenticated HTTP transport is only allowed on loopback hosts. Set MCP_HTTP_BEARER_TOKEN for public bindings, or set MCP_HTTP_UNSAFE_ALLOW_PUBLIC_UNAUTHENTICATED=true for explicit public unauthenticated development.',
+    );
+  }
+
+  return {
+    bearerToken,
+    unsafeAllowUnauthenticated,
+    unsafeAllowPublicUnauthenticated,
+    allowedOrigins,
+  };
 }
 
 export function isAuthorizedHeader(
@@ -154,54 +215,39 @@ export const evmAddressField = z
   .regex(/^0x[a-fA-F0-9]{40}$/, 'must be a 0x-prefixed 20-byte hex address')
   .describe('0x-prefixed EVM address.');
 
-function isPositiveUsdcAmount(value: string): boolean {
-  try {
-    return parseUsdc(value) > 0n;
-  } catch {
-    return false;
-  }
-}
+export const lookbackDaysField = z
+  .number()
+  .int()
+  .min(1)
+  .max(90)
+  .optional()
+  .describe('Optional analysis window in days. Defaults to the SDK default.');
 
-export const usdcAmountField = z
+export const assumedApyField = z
+  .number()
+  .min(0)
+  .max(1)
+  .optional()
+  .describe('Optional assumed yield APY as a decimal, e.g. 0.045 for 4.5%.');
+
+export const minOperatingBalanceField = z
   .string()
   .max(40, 'must be 40 characters or fewer')
   .regex(/^\d+(\.\d{1,6})?$/, 'must be a decimal USDC string with max 6 decimals')
-  .refine(isPositiveUsdcAmount, 'must be greater than 0')
-  .describe('USDC amount as a decimal string, e.g. "100.50".');
-
-export const sharesField = z
-  .string()
-  .max(78, 'must fit within a uint256 decimal string')
-  .regex(/^\d+$/, 'must be an integer string of dvUSDC base units')
-  .refine((value) => BigInt(value) > 0n, 'must be greater than 0')
-  .describe('dvUSDC shares as an integer string of base units.');
-
-export const slippageBpsField = z
-  .number()
-  .int()
-  .min(0)
-  .max(10_000)
   .optional()
-  .describe('Optional slippage tolerance in basis points. Defaults to the SDK default.');
+  .describe('Optional minimum operating balance to reserve, as a USDC decimal string.');
 
-export const checkYieldSchema = z.object({}).strict();
-export const statusSchema = z.object({}).strict();
-export const getPositionSchema = z.object({ wallet: evmAddressField }).strict();
-export const planApproveSchema = z.object({ wallet: evmAddressField, amountUsdc: usdcAmountField }).strict();
-export const planDepositSchema = z.object({
+export const analyzeWalletBehaviorSchema = z.object({
   wallet: evmAddressField,
-  amountUsdc: usdcAmountField,
-  slippageBps: slippageBpsField,
+  lookbackDays: lookbackDaysField,
 }).strict();
-export const planWithdrawSchema = z.object({
+
+export const analyzeMissedYieldSchema = z.object({
   wallet: evmAddressField,
-  amountUsdc: usdcAmountField.optional(),
-  shares: sharesField.optional(),
-  slippageBps: slippageBpsField,
-}).strict().refine(
-  (args) => (args.amountUsdc === undefined) !== (args.shares === undefined),
-  'Provide exactly one of amountUsdc or shares.',
-);
+  lookbackDays: lookbackDaysField,
+  assumedApy: assumedApyField,
+  minOperatingBalance: minOperatingBalanceField,
+}).strict();
 
 type ToolResult = {
   content: Array<{ type: 'text'; text: string }>;
@@ -220,29 +266,68 @@ export function toJsonSafe(value: unknown): unknown {
   return out;
 }
 
-function redactString(value: string): string {
-  return value
-    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
-    .replace(/(https?:\/\/[^/?#\s]+)[^\s"']*/gi, '$1/[REDACTED]')
-    .replace(/(0x)[a-fA-F0-9]{64}/g, '$1[REDACTED_PRIVATE_KEY]');
+function redactHttpUrlForLog(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl);
+    return `${url.protocol}//${url.host}/[REDACTED]`;
+  } catch {
+    return rawUrl.replace(
+      /^(https?:\/\/)(?:[^/?#\s"']*@)?([^/?#\s"']+)[^\s"']*$/i,
+      '$1$2/[REDACTED]',
+    );
+  }
 }
 
-function toLogSafe(value: unknown, key = ''): unknown {
+export function redactString(value: string): string {
+  return value
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
+    .replace(/https?:\/\/[^\s"']*/gi, (url) => redactHttpUrlForLog(url))
+    .replace(/(0x)[a-fA-F0-9]{64}/g, '$1[REDACTED_SECRET]');
+}
+
+function toLogSafe(value: unknown): unknown {
   if (typeof value === 'bigint') return value.toString();
   if (typeof value === 'string') return redactString(value);
   if (Array.isArray(value)) return value.map((item) => toLogSafe(item));
+  if (value instanceof Error) {
+    const out: Record<string, unknown> = {
+      name: value.name,
+      message: redactString(value.message),
+    };
+    if (value.stack) out.stack = redactString(value.stack).slice(0, 4_000);
+    if (value.cause !== undefined) out.cause = toLogSafe(value.cause);
+    return out;
+  }
   if (value === null || typeof value !== 'object') return value;
 
   const out: Record<string, unknown> = {};
   for (const [nestedKey, nested] of Object.entries(value as Record<string, unknown>)) {
     if (nested === undefined) continue;
-    if (/(authorization|bearer|token|secret|private|password|api[_-]?key)/i.test(nestedKey)) {
+    if (/(authorization|bearer|token|secret|private|password|api[_-]?key|rpc[_-]?url)/i.test(nestedKey)) {
       out[nestedKey] = '[REDACTED]';
     } else {
-      out[nestedKey] = toLogSafe(nested, nestedKey);
+      out[nestedKey] = toLogSafe(nested);
     }
   }
-  return key ? out : toJsonSafe(out);
+  return out;
+}
+
+export function sanitizeToolErrorForModel(_err: unknown): Error {
+  return new Error(SAFE_TOOL_ERROR_MESSAGE);
+}
+
+function withSafeToolErrors<TArgs>(
+  toolName: string,
+  handler: (args: TArgs) => Promise<ToolResult> | ToolResult,
+): (args: TArgs) => Promise<ToolResult> {
+  return async (args) => {
+    try {
+      return await handler(args);
+    } catch (err) {
+      logger.warn('mcp tool handler failed', { tool: toolName, err });
+      throw sanitizeToolErrorForModel(err);
+    }
+  };
 }
 
 export function text(data: Record<string, unknown>): ToolResult {
@@ -253,210 +338,52 @@ export function text(data: Record<string, unknown>): ToolResult {
   };
 }
 
-function asRecord(value: unknown, label: string): Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(`${label} must be an object`);
-  }
-  return value as Record<string, unknown>;
-}
-
-function recordString(record: Record<string, unknown>, key: string): string {
-  const value = record[key];
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new Error(`planned request missing string field '${key}'`);
-  }
-  return value;
-}
-
-function maybeAddress(value: unknown): string | undefined {
-  if (typeof value === 'string') return evmAddress(value);
-  if (value !== null && typeof value === 'object') {
-    const address = (value as { address?: unknown }).address;
-    if (typeof address === 'string') return evmAddress(address);
-  }
-  return undefined;
-}
-
-export function isSupportedChain(value: string): value is DivigentChain {
-  return (SUPPORTED_CHAINS as readonly string[]).includes(value);
-}
-
-export function resolveChain(env: NodeJS.ProcessEnv = process.env): DivigentChain {
-  const chain =
-    env.DIVIGENT_CHAIN ??
-    (env.BASE_SEPOLIA_RPC_URL && !env.BASE_MAINNET_RPC_URL && !env.BASE_RPC_URL
-      ? 'base-sepolia'
-      : DEFAULT_CHAIN);
-  if (!isSupportedChain(chain)) {
+export function validateChainEnvironment(env: NodeJS.ProcessEnv = process.env): void {
+  if (env.DIVIGENT_CHAIN !== undefined && env.DIVIGENT_CHAIN !== CHAIN) {
     throw new Error(
-      `DIVIGENT_CHAIN must be one of ${SUPPORTED_CHAINS.join(', ')}, got '${chain}'`,
-    );
-  }
-  return chain;
-}
-
-export function resolveRpcUrl(
-  chain: DivigentChain,
-  env: NodeJS.ProcessEnv = process.env,
-): string {
-  if (chain === 'base') {
-    return (
-      env.BASE_MAINNET_RPC_URL ??
-      env.BASE_RPC_URL ??
-      env.READ_RPC_URL ??
-      DEFAULT_MAINNET_RPC_URL
+      `DIVIGENT_CHAIN must be '${CHAIN}' for this Base-mainnet-only MCP server, got '${env.DIVIGENT_CHAIN}'. Remove stale testnet configuration before starting.`,
     );
   }
 
-  return (
-    env.BASE_SEPOLIA_RPC_URL ??
-    env.READ_RPC_URL ??
-    env.BASE_RPC_URL ??
-    DEFAULT_SEPOLIA_RPC_URL
-  );
-}
-
-export function compactTransactionFromPlan(
-  plan: { request: unknown },
-  chain: DivigentChain = DEFAULT_CHAIN,
-): Record<string, unknown> {
-  const request = asRecord(plan.request, 'planned request');
-  const abi = request.abi;
-  const functionName = recordString(request, 'functionName');
-  const args = Array.isArray(request.args) ? request.args : [];
-  const chainConfig = getChainConfig(chain);
-  const data = encodePlannedFunctionData({
-    abi: abi as never,
-    functionName,
-    args,
-  });
-
-  const tx: Record<string, unknown> = {
-    chain,
-    chainId: chainConfig.id,
-    to: recordString(request, 'address'),
-    data,
-    value: request.value ?? '0',
-    functionName,
-    args,
-  };
-  const account = maybeAddress(request.account);
-  if (account !== undefined) tx.account = account;
-  if (request.maxFeePerGas !== undefined) tx.maxFeePerGas = request.maxFeePerGas;
-  if (request.maxPriorityFeePerGas !== undefined) {
-    tx.maxPriorityFeePerGas = request.maxPriorityFeePerGas;
+  if (env.BASE_SEPOLIA_RPC_URL !== undefined) {
+    throw new Error(
+      'BASE_SEPOLIA_RPC_URL is not supported by this Base-mainnet-only MCP server. Use BASE_MAINNET_RPC_URL or BASE_RPC_URL.',
+    );
   }
-  return tx;
-}
 
-function addressFromRecord(
-  data: Record<string, unknown>,
-  key: string,
-  aliases: readonly string[] = [],
-): EvmAddress {
-  for (const candidate of [key, ...aliases]) {
-    const value = data[candidate];
-    if (typeof value === 'string' && value.length > 0) return evmAddress(value);
+  if (env.READ_RPC_URL !== undefined) {
+    throw new Error(
+      'READ_RPC_URL is a legacy RPC variable and is not supported. Use BASE_MAINNET_RPC_URL or BASE_RPC_URL.',
+    );
   }
-  throw new Error(`DIVIGENT_ADDRESSES missing required address '${key}'`);
 }
 
-function loadAddressOverrides(): DivigentConfig['addresses'] | undefined {
-  const addrFile = process.env.DIVIGENT_ADDRESSES;
-  if (!addrFile) return undefined;
-
-  const parsed = JSON.parse(readFileSync(addrFile, 'utf8')) as unknown;
-  const data = asRecord(parsed, 'DIVIGENT_ADDRESSES JSON');
-  const addresses = {
-    router: addressFromRecord(data, 'router'),
-    oracle: addressFromRecord(data, 'oracle'),
-    feeCollector: addressFromRecord(data, 'feeCollector'),
-    dvUsdc: addressFromRecord(data, 'dvUsdc'),
-    usdc: addressFromRecord(data, 'usdc'),
-    aavePool: addressFromRecord(data, 'aavePool'),
-    aToken: addressFromRecord(data, 'aToken', ['aaveAToken']),
-    steakhouseUSDCPrimeVault: addressFromRecord(data, 'steakhouseUSDCPrimeVault', ['morphoVault']),
-  };
-  logger.info('using custom addresses', { from: addrFile });
-  return addresses;
+export function resolveRpcUrl(env: NodeJS.ProcessEnv = process.env): string {
+  validateChainEnvironment(env);
+  return env.BASE_MAINNET_RPC_URL ?? env.BASE_RPC_URL ?? DEFAULT_MAINNET_RPC_URL;
 }
 
 type Runtime = {
-  chain: DivigentChain;
-  chainId: number;
-  chainConfig: ChainConfig;
+  chain: typeof CHAIN;
+  chainId: typeof CHAIN_ID;
   readRpc: string;
-  maxPlanAmount: bigint;
-  addresses: DivigentConfig['addresses'] | undefined;
-  readDivigent: Divigent;
-  publicClient: DivigentConfig['publicClient'];
 };
 
 export async function loadRuntime(): Promise<Runtime> {
-  const chain = resolveChain();
-  const chainConfig = getChainConfig(chain);
-  const readRpc = resolveRpcUrl(chain);
-  const maxPlanAmount = parseUsdc(process.env.DIVIGENT_MCP_MAX_PLAN_USDC ?? DEFAULT_MAX_PLAN_USDC);
-  const publicClient = createPublicClient({ chain: chainConfig.viemChain, transport: http(readRpc) });
-  const addresses = loadAddressOverrides();
-
-  if (!addresses) assertProtocolDeployed(chain);
-
-  const config: DivigentConfig = {
-    publicClient: publicClient as DivigentConfig['publicClient'],
-    chain,
-  };
-  if (addresses) config.addresses = addresses;
-
-  const readDivigent = Divigent.create(config);
-  await readDivigent.verifyAddresses();
+  assertProtocolDeployed(CHAIN);
+  const readRpc = resolveRpcUrl();
 
   logger.info('divigent MCP runtime initialised', {
-    chain,
-    chainId: chainConfig.id,
-    maxPlanUsdc: formatUsdc(maxPlanAmount),
+    chain: CHAIN,
+    chainId: CHAIN_ID,
+    rpcSource: readRpc === DEFAULT_MAINNET_RPC_URL ? 'default' : 'env',
   });
 
   return {
-    chain,
-    chainId: chainConfig.id,
-    chainConfig,
+    chain: CHAIN,
+    chainId: CHAIN_ID,
     readRpc,
-    maxPlanAmount,
-    addresses,
-    readDivigent,
-    publicClient: publicClient as DivigentConfig['publicClient'],
   };
-}
-
-export function makePlanningWalletClient(
-  wallet: EvmAddress,
-  chain: DivigentChain = DEFAULT_CHAIN,
-): NonNullable<DivigentConfig['walletClient']> {
-  return {
-    account: { address: wallet, type: 'json-rpc' },
-    chain: getChainConfig(chain).viemChain,
-  } as unknown as NonNullable<DivigentConfig['walletClient']>;
-}
-
-export function planningDivigent(runtime: Runtime, wallet: EvmAddress): Divigent {
-  const config: DivigentConfig = {
-    publicClient: runtime.publicClient,
-    walletClient: makePlanningWalletClient(wallet, runtime.chain),
-    chain: runtime.chain,
-  };
-  if (runtime.addresses) config.addresses = runtime.addresses;
-  return Divigent.create(config);
-}
-
-export function parseCappedUsdc(value: string, runtime: Pick<Runtime, 'maxPlanAmount'>): bigint {
-  const amount = parseUsdc(value);
-  if (amount > runtime.maxPlanAmount) {
-    throw new Error(
-      `amountUsdc exceeds MCP planning cap of ${formatUsdc(runtime.maxPlanAmount)} USDC`,
-    );
-  }
-  return amount;
 }
 
 export function parsePort(value: string): number {
@@ -465,6 +392,21 @@ export function parsePort(value: string): number {
     throw new Error(`MCP_PORT must be an integer from 1 to 65535, got '${value}'`);
   }
   return port;
+}
+
+export function parseHttpMaxConcurrentRequests(value: string): number {
+  const maxConcurrentRequests = Number.parseInt(value, 10);
+  if (
+    !/^\d+$/.test(value) ||
+    !Number.isInteger(maxConcurrentRequests) ||
+    maxConcurrentRequests < 1 ||
+    maxConcurrentRequests > MAX_HTTP_MAX_CONCURRENT_REQUESTS
+  ) {
+    throw new Error(
+      `MCP_HTTP_MAX_CONCURRENT_REQUESTS must be an integer from 1 to ${MAX_HTTP_MAX_CONCURRENT_REQUESTS}, got '${value}'`,
+    );
+  }
+  return maxConcurrentRequests;
 }
 
 type JsonBodyReadResult =
@@ -495,281 +437,133 @@ export async function readJsonBodyWithLimit(
   }
 }
 
-export function buildServer(runtime: Runtime): McpServer {
-  const divigent = runtime.readDivigent;
+function walletBehaviorInput(
+  runtime: Runtime,
+  wallet: EvmAddress,
+  lookbackDays: number | undefined,
+): AnalyzeWalletBehaviorInput {
+  const input: AnalyzeWalletBehaviorInput = {
+    wallet,
+    chainId: runtime.chainId,
+    rpcUrl: runtime.readRpc,
+  };
+  if (lookbackDays !== undefined) input.lookbackDays = lookbackDays;
+  return input;
+}
+
+function missedYieldInput(
+  runtime: Runtime,
+  args: z.infer<typeof analyzeMissedYieldSchema>,
+): AnalyzeMissedYieldInput {
+  const input: AnalyzeMissedYieldInput = {
+    wallet: evmAddress(args.wallet),
+    chainId: runtime.chainId,
+    rpcUrl: runtime.readRpc,
+  };
+  if (args.lookbackDays !== undefined) input.lookbackDays = args.lookbackDays;
+  if (args.assumedApy !== undefined) input.assumedApy = args.assumedApy;
+  if (args.minOperatingBalance !== undefined) input.minOperatingBalance = args.minOperatingBalance;
+  return input;
+}
+
+export function buildServer(runtime: Runtime, options: { log?: boolean } = {}): McpServer {
   const server = new McpServer({
     name: 'divigent-mcp',
-    version: '0.1.0',
+    version: SERVER_VERSION,
   });
 
   server.registerTool(
-    'divigent_check_yield',
+    'analyze_wallet_behavior',
     {
       description:
-        "Read current Aave/Morpho yield rates and the oracle's current safe optimal vault.",
-      inputSchema: checkYieldSchema,
+        'Read-only analysis of Base mainnet USDC wallet behavior for x402 agent wallets.',
+      inputSchema: analyzeWalletBehaviorSchema,
     },
-    async () => {
-      const [optimal, allRates] = await Promise.all([
-        divigent.getOptimalVault(),
-        divigent.getAllRates(),
-      ]);
-      return text({
-        chain: runtime.chain,
-        chainId: runtime.chainId,
-        optimal: {
-          vault: optimal.vault,
-          vaultType: optimal.vaultType,
-          twarRatePerSecondRay: optimal.twarRate,
-        },
-        allRates: allRates.map((rate) => ({
-          vault: rate.vault,
-          vaultType: rate.vaultType,
-          twarRatePerSecondRay: rate.twarRate,
-          spotRatePerSecondRay: rate.spotRate,
-          isSafe: rate.isSafe,
-        })),
-      });
-    },
-  );
-
-  server.registerTool(
-    'divigent_get_position',
-    {
-      description:
-        'Read wallet position, liquid USDC, dvUSDC shares, and Divigent router allowance.',
-      inputSchema: getPositionSchema,
-    },
-    async (args) => {
+    withSafeToolErrors('analyze_wallet_behavior', async (args) => {
       const wallet = evmAddress(args.wallet);
-      const [position, liquid, allowance, shares] = await Promise.all([
-        divigent.getPosition(wallet),
-        divigent.usdcBalance(wallet),
-        divigent.usdcAllowance(wallet),
-        divigent.dvUsdcBalance(wallet),
-      ]);
+      const report = await analyzeWalletBehavior(
+        walletBehaviorInput(runtime, wallet, args.lookbackDays),
+      );
       return text({
+        tool: 'analyze_wallet_behavior',
         chain: runtime.chain,
         chainId: runtime.chainId,
         wallet,
-        liquidUsdc: formatUsdc(liquid),
-        liquidUsdcAtomic: liquid,
-        routerAllowanceUsdc: formatUsdc(allowance),
-        routerAllowanceUsdcAtomic: allowance,
-        depositedUsdc: formatUsdc(position.depositedUSDC),
-        depositedUsdcAtomic: position.depositedUSDC,
-        currentValueUsdc: formatUsdc(position.currentValue),
-        currentValueUsdcAtomic: position.currentValue,
-        accruedYieldUsdc: formatUsdc(position.accruedYield),
-        accruedYieldUsdcAtomic: position.accruedYield,
-        dvUsdcShares: shares,
+        report,
+        safety: {
+          readOnly: true,
+          execution: false,
+        },
       });
-    },
+    }),
   );
 
   server.registerTool(
-    'divigent_status',
+    'analyze_missed_yield',
     {
       description:
-        'Read protocol health: oracle freshness, deposits pause flag, TVL cap, total assets, allocation, treasury, and withdraw capacity.',
-      inputSchema: statusSchema,
+        'Read-only estimate of idle USDC and missed yield opportunity for a Base mainnet wallet.',
+      inputSchema: analyzeMissedYieldSchema,
     },
-    async () => {
-      const [
-        oracleStatus,
-        treasuryStatus,
-        depositsPaused,
-        currentTvlCap,
-        totalAssets,
-        pricePerShare,
-        allocation,
-        withdrawCapacity,
-      ] = await Promise.all([
-        divigent.oracleStatus(),
-        divigent.treasuryStatus(),
-        divigent.depositsPaused(),
-        divigent.currentTVLCap(),
-        divigent.totalVaultAssets(),
-        divigent.pricePerShare(),
-        divigent.getCurrentAllocation(),
-        divigent.withdrawCapacity(),
-      ]);
-      const rotationPending = treasuryStatus.pending !== ZERO_ADDRESS;
-      return text({
-        chain: runtime.chain,
-        chainId: runtime.chainId,
-        addresses: divigent.addresses,
-        oracle: {
-          fresh: oracleStatus.fresh,
-          lastObservationTime: oracleStatus.lastObservationTime,
-        },
-        treasury: {
-          current: treasuryStatus.current,
-          rotationPending,
-          ...(rotationPending && {
-            pending: treasuryStatus.pending,
-            effectiveAt: treasuryStatus.effectiveAt,
-          }),
-        },
-        depositsPaused,
-        tvlCapUsdc: formatUsdc(currentTvlCap),
-        tvlCapUsdcAtomic: currentTvlCap,
-        totalAssetsUsdc: formatUsdc(totalAssets),
-        totalAssetsUsdcAtomic: totalAssets,
-        pricePerShare,
-        allocation: {
-          aaveAssetsUsdc: formatUsdc(allocation.aaveAssets),
-          aaveAssetsUsdcAtomic: allocation.aaveAssets,
-          morphoAssetsUsdc: formatUsdc(allocation.morphoAssets),
-          morphoAssetsUsdcAtomic: allocation.morphoAssets,
-        },
-        withdrawCapacity: {
-          aaveAssetsHeldUsdc: formatUsdc(withdrawCapacity.aaveAssetsHeld),
-          aaveAssetsHeldUsdcAtomic: withdrawCapacity.aaveAssetsHeld,
-          aaveIdleLiquidityUsdc: formatUsdc(withdrawCapacity.aaveIdleLiquidity),
-          aaveIdleLiquidityUsdcAtomic: withdrawCapacity.aaveIdleLiquidity,
-          aaveWithdrawCapUsdc: formatUsdc(withdrawCapacity.aaveWithdrawCap),
-          aaveWithdrawCapUsdcAtomic: withdrawCapacity.aaveWithdrawCap,
-          morphoAssetsHeldUsdc: formatUsdc(withdrawCapacity.morphoAssetsHeld),
-          morphoAssetsHeldUsdcAtomic: withdrawCapacity.morphoAssetsHeld,
-          morphoWithdrawCapUsdc: formatUsdc(withdrawCapacity.morphoWithdrawCap),
-          morphoWithdrawCapUsdcAtomic: withdrawCapacity.morphoWithdrawCap,
-          morphoReachable: withdrawCapacity.morphoReachable,
-          totalWithdrawCapUsdc: formatUsdc(withdrawCapacity.totalWithdrawCap),
-          totalWithdrawCapUsdcAtomic: withdrawCapacity.totalWithdrawCap,
-        },
-      });
-    },
-  );
-
-  server.registerTool(
-    'divigent_plan_approve_usdc',
-    {
-      description:
-        'Plan an unsigned USDC approval for the Divigent router. Does not sign or broadcast.',
-      inputSchema: planApproveSchema,
-    },
-    async (args) => {
+    withSafeToolErrors('analyze_missed_yield', async (args) => {
       const wallet = evmAddress(args.wallet);
-      const amount = parseCappedUsdc(args.amountUsdc, runtime);
-      const plan = await planningDivigent(runtime, wallet).planApproveUsdc(amount);
+      const report = await analyzeMissedYield(missedYieldInput(runtime, args));
       return text({
+        tool: 'analyze_missed_yield',
         chain: runtime.chain,
         chainId: runtime.chainId,
-        warning: TOOL_WARNING,
-        action: 'approveUsdc',
         wallet,
-        token: plan.token,
-        spender: plan.spender,
-        amountUsdc: formatUsdc(plan.amount),
-        amountUsdcAtomic: plan.amount,
-        approvalAmountUsdc: formatUsdc(plan.approvalAmount),
-        approvalAmountUsdcAtomic: plan.approvalAmount,
-        simulationResult: plan.simulationResult,
-        note: plan.approvalAmount > plan.amount
-          ? 'Approval amount includes a one-atomic-unit USDC buffer from the SDK to avoid exact-allowance deposit edge cases.'
-          : 'Approval amount matches requested amount.',
-        transaction: compactTransactionFromPlan(plan, runtime.chain),
+        report,
+        safety: {
+          readOnly: true,
+          execution: false,
+        },
       });
-    },
+    }),
   );
 
-  server.registerTool(
-    'divigent_plan_deposit',
-    {
-      description:
-        'Plan an unsigned Divigent deposit. Returns approval requirement and unsigned calldata. Does not sign or broadcast.',
-      inputSchema: planDepositSchema,
-    },
-    async (args) => {
-      const wallet = evmAddress(args.wallet);
-      const amount = parseCappedUsdc(args.amountUsdc, runtime);
-      const plan = await planningDivigent(runtime, wallet).planDeposit({
-        wallet,
-        amount,
-        ...(args.slippageBps !== undefined && { slippageBps: args.slippageBps }),
-      });
-      return text({
-        chain: runtime.chain,
-        chainId: runtime.chainId,
-        warning: TOOL_WARNING,
-        action: 'deposit',
-        wallet,
-        amountUsdc: formatUsdc(plan.amount),
-        amountUsdcAtomic: plan.amount,
-        previewShares: plan.previewShares,
-        minSharesOut: plan.minSharesOut,
-        slippageBps: plan.slippageBps,
-        allowanceUsdc: formatUsdc(plan.allowance),
-        allowanceUsdcAtomic: plan.allowance,
-        approvalRequiredUsdc: formatUsdc(plan.approvalRequired),
-        approvalRequiredUsdcAtomic: plan.approvalRequired,
-        needsApproval: plan.approvalRequired > 0n,
-        simulated: plan.simulated,
-        simulatedSharesOut: plan.simulatedSharesOut,
-        note: plan.approvalRequired > 0n
-          ? 'Deposit was not simulated because current router allowance is insufficient. Call divigent_plan_approve_usdc first.'
-          : 'Deposit was simulated successfully at current chain state.',
-        transaction: compactTransactionFromPlan(plan, runtime.chain),
-      });
-    },
-  );
-
-  server.registerTool(
-    'divigent_plan_withdraw',
-    {
-      description:
-        'Plan an unsigned Divigent withdrawal by exact shares or desired net USDC. Does not sign or broadcast.',
-      inputSchema: planWithdrawSchema,
-    },
-    async (args) => {
-      const wallet = evmAddress(args.wallet);
-      if (args.amountUsdc !== undefined && args.shares !== undefined) {
-        throw new Error('Pass either amountUsdc or shares, not both.');
-      }
-      if (args.amountUsdc === undefined && args.shares === undefined) {
-        throw new Error('Provide one of amountUsdc or shares.');
-      }
-
-      const planner = planningDivigent(runtime, wallet);
-      let shares: bigint;
-      let desiredUsdc: bigint | undefined;
-      if (args.amountUsdc !== undefined) {
-        desiredUsdc = parseCappedUsdc(args.amountUsdc, runtime);
-        shares = await divigent.previewWithdrawNet(desiredUsdc, wallet);
-      } else {
-        shares = BigInt(args.shares as string);
-      }
-
-      const plan = await planner.planWithdraw({
-        wallet,
-        shares,
-        ...(args.slippageBps !== undefined && { slippageBps: args.slippageBps }),
-      });
-      return text({
-        chain: runtime.chain,
-        chainId: runtime.chainId,
-        warning: TOOL_WARNING,
-        action: 'withdraw',
-        wallet,
-        mode: desiredUsdc !== undefined ? 'desiredUsdc' : 'shares',
-        desiredUsdc: desiredUsdc !== undefined ? formatUsdc(desiredUsdc) : undefined,
-        desiredUsdcAtomic: desiredUsdc,
-        shares: plan.shares,
-        previewUsdcOut: formatUsdc(plan.previewUsdcOut),
-        previewUsdcOutAtomic: plan.previewUsdcOut,
-        minUsdcOut: formatUsdc(plan.minUsdcOut),
-        minUsdcOutAtomic: plan.minUsdcOut,
-        slippageBps: plan.slippageBps,
-        simulatedUsdcOut: formatUsdc(plan.simulatedUsdcOut),
-        simulatedUsdcOutAtomic: plan.simulatedUsdcOut,
-        transaction: compactTransactionFromPlan(plan, runtime.chain),
-      });
-    },
-  );
-
-  logger.info('mcp server constructed', { tools: 6 });
+  if (options.log !== false) logger.info('mcp server constructed', { tools: [...TOOL_NAMES] });
   return server;
+}
+
+type McpServerPool = {
+  capacity: number;
+  active: number;
+  available: number;
+  acquire(): McpServer | undefined;
+  release(server: McpServer): void;
+  closeAll(): Promise<void>;
+};
+
+export function createMcpServerPool(runtime: Runtime, size: number): McpServerPool {
+  const all = Array.from({ length: size }, () => buildServer(runtime, { log: false }));
+  const available = [...all];
+  const inUse = new Set<McpServer>();
+
+  return {
+    get capacity() {
+      return all.length;
+    },
+    get active() {
+      return inUse.size;
+    },
+    get available() {
+      return available.length;
+    },
+    acquire() {
+      const server = available.pop();
+      if (!server) return undefined;
+      inUse.add(server);
+      return server;
+    },
+    release(server) {
+      if (!inUse.delete(server)) return;
+      available.push(server);
+    },
+    async closeAll() {
+      await Promise.all(all.map((server) => server.close()));
+    },
+  };
 }
 
 async function runStdio(runtime: Runtime): Promise<void> {
@@ -787,9 +581,30 @@ async function runHttp(runtime: Runtime): Promise<void> {
 
   const port = parsePort(process.env.MCP_PORT ?? String(DEFAULT_HTTP_PORT));
   const host = process.env.MCP_HOST ?? DEFAULT_HTTP_HOST;
-  const httpSecurity = loadHttpSecurityConfig();
+  const httpSecurity = loadHttpSecurityConfig(process.env, host);
+  const maxConcurrentRequests = parseHttpMaxConcurrentRequests(
+    process.env.MCP_HTTP_MAX_CONCURRENT_REQUESTS ??
+      String(DEFAULT_HTTP_MAX_CONCURRENT_REQUESTS),
+  );
+  const serverPool = createMcpServerPool(runtime, maxConcurrentRequests);
+  logger.info('mcp http server pool constructed', {
+    capacity: serverPool.capacity,
+    tools: [...TOOL_NAMES],
+  });
 
   const httpServer = httpServerModule.createServer(async (req, res) => {
+    let server: McpServer | undefined;
+    let transport:
+      | InstanceType<typeof StreamableHTTPServerTransport>
+      | undefined;
+    let closedTransport = false;
+    const closeTransport = async (): Promise<void> => {
+      if (closedTransport) return;
+      closedTransport = true;
+      if (transport) await transport.close();
+      if (server) await server.close();
+    };
+
     try {
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
 
@@ -840,6 +655,16 @@ async function runHttp(runtime: Runtime): Promise<void> {
         return;
       }
 
+      server = serverPool.acquire();
+      if (!server) {
+        res.writeHead(503, {
+          'Content-Type': 'application/json',
+          'Retry-After': '1',
+        });
+        res.end(JSON.stringify({ error: 'server busy' }));
+        return;
+      }
+
       const parsedBody = await readJsonBodyWithLimit(req);
       if (!parsedBody.ok) {
         res.writeHead(parsedBody.status, { 'Content-Type': 'application/json' });
@@ -847,17 +672,15 @@ async function runHttp(runtime: Runtime): Promise<void> {
         return;
       }
 
-      const server = buildServer(runtime);
       const transportOptions = {
         sessionIdGenerator: undefined,
       } as unknown as ConstructorParameters<typeof StreamableHTTPServerTransport>[0];
-      const transport = new StreamableHTTPServerTransport(transportOptions);
+      transport = new StreamableHTTPServerTransport(transportOptions);
+      res.once('close', () => {
+        void closeTransport();
+      });
       await server.connect(transport as unknown as Parameters<McpServer['connect']>[0]);
       await transport.handleRequest(req, res, parsedBody.body);
-      res.on('close', () => {
-        void transport.close();
-        void server.close();
-      });
     } catch (err) {
       logger.error('http request failed', {
         err: err instanceof Error ? err.message : String(err),
@@ -866,6 +689,15 @@ async function runHttp(runtime: Runtime): Promise<void> {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'internal error' }));
       }
+    } finally {
+      try {
+        await closeTransport();
+      } catch (err) {
+        logger.warn('http transport cleanup failed', {
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+      if (server) serverPool.release(server);
     }
   });
 
@@ -874,6 +706,7 @@ async function runHttp(runtime: Runtime): Promise<void> {
       host,
       port,
       auth: httpSecurity.bearerToken ? 'bearer' : 'unsafe-disabled',
+      maxConcurrentRequests: serverPool.capacity,
     });
   });
 
@@ -881,7 +714,13 @@ async function runHttp(runtime: Runtime): Promise<void> {
     logger.info('shutting down', { signal });
     httpServer.close((err) => {
       if (err) logger.error('http close error', { err: err.message });
-      process.exit(err ? 1 : 0);
+      serverPool.closeAll()
+        .catch((closeErr) => {
+          logger.error('mcp server pool close error', {
+            err: closeErr instanceof Error ? closeErr.message : String(closeErr),
+          });
+        })
+        .finally(() => process.exit(err ? 1 : 0));
     });
     setTimeout(() => process.exit(1), 5_000).unref();
   };

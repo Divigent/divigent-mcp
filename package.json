@@ -1,7 +1,7 @@
 {
   "name": "@divigent/mcp-server",
-  "version": "1.0.0",
-  "description": "Model Context Protocol server for Divigent read tools and unsigned transaction planning.",
+  "version": "1.0.1",
+  "description": "Read-only Model Context Protocol wallet analysis server for Divigent on Base.",
   "license": "MIT",
   "author": "Divigent Protocol",
   "repository": {
@@ -40,7 +40,7 @@
     "prepublishOnly": "npm run clean && npm run typecheck && npm run typecheck:test && npm run build && npm test"
   },
   "dependencies": {
-    "@divigent/sdk": "1.0.2",
+    "@divigent/sdk": "1.0.4",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "viem": "^2.21.0",
     "zod": "^3.24.0"
@@ -62,13 +62,15 @@
     "mcp",
     "model-context-protocol",
     "ai-agents",
-    "defi",
-    "yield",
     "base",
     "x402",
+    "wallet-analysis",
+    "missed-yield",
+    "treasury",
     "claude",
     "cursor",
     "read-only",
-    "transaction-planning"
+    "defi",
+    "yield"
   ]
 }
