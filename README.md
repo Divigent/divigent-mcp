@@ -11,7 +11,7 @@ address and return calldata for an external wallet to review and submit.
 
 | Tool | Purpose |
 | --- | --- |
-| `divigent_check_yield` | Current Aave/Morpho rates and oracle-selected safe vault |
+| `divigent_check_yield` | Current Aave/Morpho rates, oracle-selected safe vault, oracle freshness, pause flag, and rate-decision block |
 | `divigent_get_position` | Wallet USDC, dvUSDC, router allowance, and Divigent position |
 | `divigent_status` | Oracle freshness, treasury, pause flag, TVL, allocation, withdrawal capacity |
 | `divigent_plan_approve_usdc` | Unsigned USDC approval plan for the Divigent router |
@@ -47,13 +47,13 @@ npx -y @divigent/mcp-server
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `BASE_MAINNET_RPC_URL` | `https://mainnet.base.org` | Preferred Base mainnet RPC URL |
+| `BASE_MAINNET_RPC_URL` | `https://mainnet.base.org` | Preferred Base mainnet RPC URL when `DIVIGENT_CHAIN=base` |
 | `BASE_SEPOLIA_RPC_URL` | `https://sepolia.base.org` | Preferred Base Sepolia RPC URL when `DIVIGENT_CHAIN=base-sepolia` |
 | `READ_RPC_URL` | unset | Fallback RPC URL |
 | `BASE_RPC_URL` | unset | Fallback RPC URL |
-| `DIVIGENT_CHAIN` | `base` | `base` or `base-sepolia` |
+| `DIVIGENT_CHAIN` | required | `base` or `base-sepolia`; never inferred from RPC URL variables |
 | `DIVIGENT_ADDRESSES` | unset | Optional JSON address override |
-| `DIVIGENT_MCP_MAX_PLAN_USDC` | `100` | Per-plan amount cap for approval/deposit/target withdraw |
+| `DIVIGENT_MCP_MAX_PLAN_USDC` | `100` | Per-plan USDC cap for approval, deposit, target withdraw, and shares-withdraw preview |
 | `MCP_TRANSPORT` | `stdio` | `stdio` or `http` |
 | `MCP_LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 
@@ -63,9 +63,11 @@ HTTP-only:
 | --- | --- | --- |
 | `MCP_HOST` | `127.0.0.1` | HTTP bind host |
 | `MCP_PORT` | `3000` | HTTP bind port |
-| `MCP_HTTP_BEARER_TOKEN` | unset | Required for HTTP unless unsafe mode is explicit |
-| `MCP_HTTP_ALLOWED_ORIGINS` | unset | Comma-separated exact browser origins |
-| `MCP_HTTP_UNSAFE_ALLOW_UNAUTHENTICATED` | unset | Local testing escape hatch |
+| `MCP_HTTP_BEARER_TOKEN` | unset | Required high-entropy bearer token for HTTP unless unsafe local mode is explicit |
+| `MCP_HTTP_ALLOWED_ORIGINS` | unset | Comma-separated exact browser CORS origins; not an access-control mechanism |
+| `MCP_HTTP_MAX_CONCURRENT_REQUESTS` | `16` | Concurrent authenticated POST handling limit, max `256` |
+| `MCP_HTTP_UNSAFE_ALLOW_UNAUTHENTICATED` | unset | Loopback-only local testing escape hatch |
+| `MCP_HTTP_UNSAFE_ALLOW_PUBLIC_UNAUTHENTICATED` | unset | Extra explicit override for public unauthenticated development only |
 
 There is intentionally no `AGENT_PK`.
 
@@ -89,9 +91,11 @@ on startup.
 For Base Sepolia testing, set `DIVIGENT_CHAIN=base-sepolia` and
 `BASE_SEPOLIA_RPC_URL=https://sepolia.base.org`.
 
-Legacy configs that only set `BASE_SEPOLIA_RPC_URL` and do not set
-`DIVIGENT_CHAIN`, `BASE_MAINNET_RPC_URL`, or `BASE_RPC_URL` continue to resolve
-to Base Sepolia.
+`DIVIGENT_CHAIN` is required. The server does not infer the chain from RPC URL
+environment variables. If an explicit chain conflicts with a chain-specific RPC
+variable, for example `DIVIGENT_CHAIN=base-sepolia` with
+`BASE_MAINNET_RPC_URL`, startup fails instead of silently choosing a different
+network.
 
 ### Claude Desktop
 
@@ -242,7 +246,22 @@ npx @divigent/mcp-server
 The server exposes `POST /` and `POST /mcp` for stateless Streamable HTTP and
 `GET /healthz` for liveness. HTTP binds to `127.0.0.1` by default, all routes
 require bearer auth unless unsafe mode is explicitly set, and JSON request
-bodies are capped at 64 KiB. Put remote deployments behind TLS.
+bodies are capped at 64 KiB. Bearer tokens must be strong; use
+`openssl rand -hex 32` to generate one.
+
+Unauthenticated HTTP mode is only accepted on loopback hosts by default. Public
+HTTP bindings must use `MCP_HTTP_BEARER_TOKEN`. The
+`MCP_HTTP_UNSAFE_ALLOW_PUBLIC_UNAUTHENTICATED=true` override exists only for
+explicit public development experiments.
+
+`MCP_HTTP_ALLOWED_ORIGINS` is browser CORS configuration only. Non-browser MCP
+clients such as curl, Python, Claude Desktop, Cursor, and Codex usually omit the
+`Origin` header and are not restricted by CORS; use bearer auth, TLS, firewall
+rules, and network placement for access control.
+
+Authenticated POST work is bounded by `MCP_HTTP_MAX_CONCURRENT_REQUESTS`
+(default `16`). For production, put remote deployments behind TLS and a reverse
+proxy with per-IP rate limiting.
 
 ## Address Overrides
 
@@ -276,10 +295,17 @@ npm test
 
 - No private key is read from environment or disk.
 - No MCP tool calls SDK broadcast methods.
-- Planning tools return unsigned calldata and metadata only.
-- HTTP transport requires bearer auth by default.
-- Browser origins are denied unless explicitly allowlisted.
+- Planning tools return unsigned calldata and metadata only, with capped USDC
+  plan amounts and capped slippage.
+- `DIVIGENT_CHAIN` must be explicit; chain/RPC mismatches fail at startup.
+- HTTP transport requires a strong bearer token by default.
+- Unauthenticated HTTP mode is loopback-only unless a separate public unsafe
+  override is set.
+- Browser origins are denied unless explicitly allowlisted, but CORS is not
+  access control for non-browser clients.
 - HTTP JSON request bodies are capped at 64 KiB.
+- Authenticated HTTP POST handling is bounded by a fixed server pool.
+- Tool-handler errors are sanitized before they can be returned to the AI model.
 - All diagnostics go to stderr so stdio JSON-RPC stdout remains clean.
 
 ## License

@@ -18,6 +18,7 @@
 import { timingSafeEqual } from 'crypto';
 import { readFileSync, realpathSync } from 'fs';
 import type { IncomingMessage } from 'http';
+import { isIP } from 'net';
 import { resolve } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -47,11 +48,18 @@ export const DEFAULT_MAINNET_RPC_URL = 'https://mainnet.base.org';
 export const DEFAULT_SEPOLIA_RPC_URL = 'https://sepolia.base.org';
 export const DEFAULT_RPC_URL = DEFAULT_MAINNET_RPC_URL;
 export const DEFAULT_MAX_PLAN_USDC = '100';
+export const DEFAULT_MAX_SLIPPAGE_BPS = 500;
 export const DEFAULT_HTTP_HOST = '127.0.0.1';
 export const DEFAULT_HTTP_PORT = 3000;
+export const DEFAULT_HTTP_MAX_CONCURRENT_REQUESTS = 16;
+export const MAX_HTTP_MAX_CONCURRENT_REQUESTS = 256;
 export const MAX_HTTP_BODY_BYTES = 64 * 1024;
+export const MIN_HTTP_BEARER_TOKEN_LENGTH = 32;
+export const MIN_HTTP_BEARER_TOKEN_SHANNON_BITS = 128;
+export const SAFE_TOOL_ERROR_MESSAGE =
+  'Divigent MCP tool failed while reading chain data. Error details were redacted; check MCP server logs.';
 export const TOOL_WARNING =
-  'Unsigned transaction plan only. This MCP server cannot sign or broadcast; review chain, contract, calldata, and amounts in a wallet you control before submitting. Base mainnet plans use real funds.';
+  'Unsigned transaction plan only. This MCP server cannot sign or broadcast; review chain, contract, calldata, amounts, minSharesOut, and minUsdcOut in a wallet you control before submitting. Base mainnet plans use real funds.';
 export const READ_TOOL_NAMES = [
   'divigent_check_yield',
   'divigent_get_position',
@@ -105,9 +113,92 @@ type HttpSecurityConfig = {
   allowedOrigins: ReadonlySet<string>;
 };
 
-export function loadHttpSecurityConfig(env: NodeJS.ProcessEnv = process.env): HttpSecurityConfig {
-  const bearerToken = env.MCP_HTTP_BEARER_TOKEN;
+export function shannonEntropyBits(value: string): number {
+  if (value.length === 0) return 0;
+  const counts = new Map<string, number>();
+  for (const char of value) counts.set(char, (counts.get(char) ?? 0) + 1);
+
+  let entropyPerChar = 0;
+  for (const count of counts.values()) {
+    const probability = count / value.length;
+    entropyPerChar -= probability * Math.log2(probability);
+  }
+  return entropyPerChar * value.length;
+}
+
+function isRepeatedPattern(value: string): boolean {
+  for (let length = 1; length <= Math.floor(value.length / 2); length += 1) {
+    if (value.length % length !== 0) continue;
+    const pattern = value.slice(0, length);
+    if (pattern.repeat(value.length / length) === value) return true;
+  }
+  return false;
+}
+
+export function validateHttpBearerToken(token: string): void {
+  if (token.length < MIN_HTTP_BEARER_TOKEN_LENGTH) {
+    throw new Error(
+      `MCP_HTTP_BEARER_TOKEN must be at least ${MIN_HTTP_BEARER_TOKEN_LENGTH} characters`,
+    );
+  }
+  if (/\s/.test(token)) {
+    throw new Error('MCP_HTTP_BEARER_TOKEN must not contain whitespace');
+  }
+  if (isRepeatedPattern(token)) {
+    throw new Error('MCP_HTTP_BEARER_TOKEN must not be a repeated pattern');
+  }
+
+  const lower = token.toLowerCase();
+  const placeholderTerms = [
+    'admin',
+    'bearer',
+    'changeme',
+    'change-me',
+    'default',
+    'divigent',
+    'example',
+    'password',
+    'placeholder',
+    'secret',
+    'test',
+    'token',
+  ];
+  if (placeholderTerms.some((term) => lower.includes(term))) {
+    throw new Error('MCP_HTTP_BEARER_TOKEN looks like a placeholder or weak secret');
+  }
+
+  if (shannonEntropyBits(token) < MIN_HTTP_BEARER_TOKEN_SHANNON_BITS) {
+    throw new Error(
+      `MCP_HTTP_BEARER_TOKEN must have at least ${MIN_HTTP_BEARER_TOKEN_SHANNON_BITS} bits of estimated entropy`,
+    );
+  }
+}
+
+export function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  const unbracketed =
+    normalized.startsWith('[') && normalized.endsWith(']')
+      ? normalized.slice(1, -1)
+      : normalized;
+
+  if (unbracketed === 'localhost') return true;
+  const ipType = isIP(unbracketed);
+  if (ipType === 4) return unbracketed.startsWith('127.');
+  if (ipType === 6) return unbracketed === '::1' || unbracketed === '0:0:0:0:0:0:0:1';
+  return false;
+}
+
+export function loadHttpSecurityConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  host = env.MCP_HOST ?? DEFAULT_HTTP_HOST,
+): HttpSecurityConfig {
+  const bearerToken =
+    env.MCP_HTTP_BEARER_TOKEN !== undefined && env.MCP_HTTP_BEARER_TOKEN.length > 0
+      ? env.MCP_HTTP_BEARER_TOKEN
+      : undefined;
   const unsafeAllowUnauthenticated = env.MCP_HTTP_UNSAFE_ALLOW_UNAUTHENTICATED === 'true';
+  const unsafeAllowPublicUnauthenticated =
+    env.MCP_HTTP_UNSAFE_ALLOW_PUBLIC_UNAUTHENTICATED === 'true';
   const allowedOrigins = new Set(
     (env.MCP_HTTP_ALLOWED_ORIGINS ?? '')
       .split(',')
@@ -115,9 +206,21 @@ export function loadHttpSecurityConfig(env: NodeJS.ProcessEnv = process.env): Ht
       .filter((origin) => origin.length > 0),
   );
 
+  if (bearerToken) validateHttpBearerToken(bearerToken);
+
   if (!bearerToken && !unsafeAllowUnauthenticated) {
     throw new Error(
       'HTTP transport requires MCP_HTTP_BEARER_TOKEN. For local-only testing, set MCP_HTTP_UNSAFE_ALLOW_UNAUTHENTICATED=true explicitly.',
+    );
+  }
+  if (
+    !bearerToken &&
+    unsafeAllowUnauthenticated &&
+    !isLoopbackHost(host) &&
+    !unsafeAllowPublicUnauthenticated
+  ) {
+    throw new Error(
+      'Unauthenticated HTTP transport is only allowed on loopback hosts. Set MCP_HTTP_BEARER_TOKEN for public bindings, or set MCP_HTTP_UNSAFE_ALLOW_PUBLIC_UNAUTHENTICATED=true for explicit public development use.',
     );
   }
 
@@ -180,7 +283,7 @@ export const slippageBpsField = z
   .number()
   .int()
   .min(0)
-  .max(10_000)
+  .max(DEFAULT_MAX_SLIPPAGE_BPS)
   .optional()
   .describe('Optional slippage tolerance in basis points. Defaults to the SDK default.');
 
@@ -220,10 +323,27 @@ export function toJsonSafe(value: unknown): unknown {
   return out;
 }
 
-function redactString(value: string): string {
+function redactUrl(rawUrl: string): string {
+  let candidate = rawUrl;
+  let suffix = '';
+  while (candidate.length > 0 && /[),.;!?]$/.test(candidate)) {
+    suffix = `${candidate.at(-1) ?? ''}${suffix}`;
+    candidate = candidate.slice(0, -1);
+  }
+
+  try {
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return rawUrl;
+    return `${parsed.protocol}//${parsed.host}/[REDACTED]${suffix}`;
+  } catch {
+    return rawUrl;
+  }
+}
+
+export function redactString(value: string): string {
   return value
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
-    .replace(/(https?:\/\/[^/?#\s]+)[^\s"']*/gi, '$1/[REDACTED]')
+    .replace(/https?:\/\/[^\s"'<>]+/gi, redactUrl)
     .replace(/(0x)[a-fA-F0-9]{64}/g, '$1[REDACTED_PRIVATE_KEY]');
 }
 
@@ -232,11 +352,22 @@ function toLogSafe(value: unknown, key = ''): unknown {
   if (typeof value === 'string') return redactString(value);
   if (Array.isArray(value)) return value.map((item) => toLogSafe(item));
   if (value === null || typeof value !== 'object') return value;
+  if (value instanceof Error) {
+    return toJsonSafe({
+      name: redactString(value.name),
+      message: redactString(value.message),
+      stack: value.stack ? redactString(value.stack) : undefined,
+    });
+  }
 
   const out: Record<string, unknown> = {};
   for (const [nestedKey, nested] of Object.entries(value as Record<string, unknown>)) {
     if (nested === undefined) continue;
-    if (/(authorization|bearer|token|secret|private|password|api[_-]?key)/i.test(nestedKey)) {
+    if (
+      /(authorization|bearer|token|secret|private|password|api[_-]?key|rpc[_-]?url|read[_-]?rpc)/i.test(
+        nestedKey,
+      )
+    ) {
       out[nestedKey] = '[REDACTED]';
     } else {
       out[nestedKey] = toLogSafe(nested, nestedKey);
@@ -282,11 +413,12 @@ export function isSupportedChain(value: string): value is DivigentChain {
 }
 
 export function resolveChain(env: NodeJS.ProcessEnv = process.env): DivigentChain {
-  const chain =
-    env.DIVIGENT_CHAIN ??
-    (env.BASE_SEPOLIA_RPC_URL && !env.BASE_MAINNET_RPC_URL && !env.BASE_RPC_URL
-      ? 'base-sepolia'
-      : DEFAULT_CHAIN);
+  const chain = env.DIVIGENT_CHAIN;
+  if (!chain) {
+    throw new Error(
+      `DIVIGENT_CHAIN must be set explicitly to one of ${SUPPORTED_CHAINS.join(', ')}`,
+    );
+  }
   if (!isSupportedChain(chain)) {
     throw new Error(
       `DIVIGENT_CHAIN must be one of ${SUPPORTED_CHAINS.join(', ')}, got '${chain}'`,
@@ -295,10 +427,28 @@ export function resolveChain(env: NodeJS.ProcessEnv = process.env): DivigentChai
   return chain;
 }
 
+function hasEnvValue(env: NodeJS.ProcessEnv, key: string): boolean {
+  return env[key] !== undefined && String(env[key]).length > 0;
+}
+
+function validateRpcEnvironmentForChain(chain: DivigentChain, env: NodeJS.ProcessEnv): void {
+  if (chain === 'base' && hasEnvValue(env, 'BASE_SEPOLIA_RPC_URL')) {
+    throw new Error(
+      'DIVIGENT_CHAIN=base conflicts with BASE_SEPOLIA_RPC_URL. Remove the Sepolia RPC URL or set DIVIGENT_CHAIN=base-sepolia.',
+    );
+  }
+  if (chain === 'base-sepolia' && hasEnvValue(env, 'BASE_MAINNET_RPC_URL')) {
+    throw new Error(
+      'DIVIGENT_CHAIN=base-sepolia conflicts with BASE_MAINNET_RPC_URL. Remove the mainnet RPC URL or set DIVIGENT_CHAIN=base.',
+    );
+  }
+}
+
 export function resolveRpcUrl(
   chain: DivigentChain,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
+  validateRpcEnvironmentForChain(chain, env);
   if (chain === 'base') {
     return (
       env.BASE_MAINNET_RPC_URL ??
@@ -451,12 +601,45 @@ export function planningDivigent(runtime: Runtime, wallet: EvmAddress): Divigent
 
 export function parseCappedUsdc(value: string, runtime: Pick<Runtime, 'maxPlanAmount'>): bigint {
   const amount = parseUsdc(value);
+  assertCappedUsdc(amount, runtime, 'amountUsdc');
+  return amount;
+}
+
+export class SafeToolUserError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SafeToolUserError';
+  }
+}
+
+export function assertCappedUsdc(
+  amount: bigint,
+  runtime: Pick<Runtime, 'maxPlanAmount'>,
+  label: string,
+): void {
   if (amount > runtime.maxPlanAmount) {
-    throw new Error(
-      `amountUsdc exceeds MCP planning cap of ${formatUsdc(runtime.maxPlanAmount)} USDC`,
+    throw new SafeToolUserError(
+      `${label} exceeds MCP planning cap of ${formatUsdc(runtime.maxPlanAmount)} USDC`,
     );
   }
-  return amount;
+}
+
+export function sanitizeToolErrorForModel(err: unknown): Error {
+  if (err instanceof SafeToolUserError) return err;
+  return new Error(SAFE_TOOL_ERROR_MESSAGE);
+}
+
+type ToolHandler<TArgs> = (args: TArgs) => Promise<ToolResult> | ToolResult;
+
+function withSafeToolErrors<TArgs>(toolName: string, handler: ToolHandler<TArgs>): ToolHandler<TArgs> {
+  return async (args: TArgs) => {
+    try {
+      return await handler(args);
+    } catch (err) {
+      logger.warn('mcp tool handler failed', { tool: toolName, err });
+      throw sanitizeToolErrorForModel(err);
+    }
+  };
 }
 
 export function parsePort(value: string): number {
@@ -465,6 +648,21 @@ export function parsePort(value: string): number {
     throw new Error(`MCP_PORT must be an integer from 1 to 65535, got '${value}'`);
   }
   return port;
+}
+
+export function parseHttpMaxConcurrentRequests(value: string | undefined): number {
+  if (value === undefined || value.length === 0) return DEFAULT_HTTP_MAX_CONCURRENT_REQUESTS;
+  const parsed = Number.parseInt(value, 10);
+  if (
+    !Number.isInteger(parsed) ||
+    parsed < 1 ||
+    parsed > MAX_HTTP_MAX_CONCURRENT_REQUESTS
+  ) {
+    throw new Error(
+      `MCP_HTTP_MAX_CONCURRENT_REQUESTS must be an integer from 1 to ${MAX_HTTP_MAX_CONCURRENT_REQUESTS}, got '${value}'`,
+    );
+  }
+  return parsed;
 }
 
 type JsonBodyReadResult =
@@ -495,11 +693,14 @@ export async function readJsonBodyWithLimit(
   }
 }
 
-export function buildServer(runtime: Runtime): McpServer {
+export function buildServer(
+  runtime: Runtime,
+  options: { log?: boolean } = {},
+): McpServer {
   const divigent = runtime.readDivigent;
   const server = new McpServer({
     name: 'divigent-mcp',
-    version: '0.1.0',
+    version: '1.0.1',
   });
 
   server.registerTool(
@@ -509,14 +710,23 @@ export function buildServer(runtime: Runtime): McpServer {
         "Read current Aave/Morpho yield rates and the oracle's current safe optimal vault.",
       inputSchema: checkYieldSchema,
     },
-    async () => {
-      const [optimal, allRates] = await Promise.all([
+    withSafeToolErrors('divigent_check_yield', async () => {
+      const [optimal, allRates, oracleStatus, depositsPaused, rateDecisionBlock] = await Promise.all([
         divigent.getOptimalVault(),
         divigent.getAllRates(),
+        divigent.oracleStatus(),
+        divigent.depositsPaused(),
+        runtime.publicClient.getBlockNumber(),
       ]);
       return text({
         chain: runtime.chain,
         chainId: runtime.chainId,
+        rateDecisionBlock,
+        oracle: {
+          fresh: oracleStatus.fresh,
+          lastObservationTime: oracleStatus.lastObservationTime,
+        },
+        depositsPaused,
         optimal: {
           vault: optimal.vault,
           vaultType: optimal.vaultType,
@@ -530,7 +740,7 @@ export function buildServer(runtime: Runtime): McpServer {
           isSafe: rate.isSafe,
         })),
       });
-    },
+    }),
   );
 
   server.registerTool(
@@ -540,7 +750,7 @@ export function buildServer(runtime: Runtime): McpServer {
         'Read wallet position, liquid USDC, dvUSDC shares, and Divigent router allowance.',
       inputSchema: getPositionSchema,
     },
-    async (args) => {
+    withSafeToolErrors('divigent_get_position', async (args) => {
       const wallet = evmAddress(args.wallet);
       const [position, liquid, allowance, shares] = await Promise.all([
         divigent.getPosition(wallet),
@@ -564,7 +774,7 @@ export function buildServer(runtime: Runtime): McpServer {
         accruedYieldUsdcAtomic: position.accruedYield,
         dvUsdcShares: shares,
       });
-    },
+    }),
   );
 
   server.registerTool(
@@ -574,7 +784,7 @@ export function buildServer(runtime: Runtime): McpServer {
         'Read protocol health: oracle freshness, deposits pause flag, TVL cap, total assets, allocation, treasury, and withdraw capacity.',
       inputSchema: statusSchema,
     },
-    async () => {
+    withSafeToolErrors('divigent_status', async () => {
       const [
         oracleStatus,
         treasuryStatus,
@@ -639,7 +849,7 @@ export function buildServer(runtime: Runtime): McpServer {
           totalWithdrawCapUsdcAtomic: withdrawCapacity.totalWithdrawCap,
         },
       });
-    },
+    }),
   );
 
   server.registerTool(
@@ -649,7 +859,7 @@ export function buildServer(runtime: Runtime): McpServer {
         'Plan an unsigned USDC approval for the Divigent router. Does not sign or broadcast.',
       inputSchema: planApproveSchema,
     },
-    async (args) => {
+    withSafeToolErrors('divigent_plan_approve_usdc', async (args) => {
       const wallet = evmAddress(args.wallet);
       const amount = parseCappedUsdc(args.amountUsdc, runtime);
       const plan = await planningDivigent(runtime, wallet).planApproveUsdc(amount);
@@ -671,7 +881,7 @@ export function buildServer(runtime: Runtime): McpServer {
           : 'Approval amount matches requested amount.',
         transaction: compactTransactionFromPlan(plan, runtime.chain),
       });
-    },
+    }),
   );
 
   server.registerTool(
@@ -681,7 +891,7 @@ export function buildServer(runtime: Runtime): McpServer {
         'Plan an unsigned Divigent deposit. Returns approval requirement and unsigned calldata. Does not sign or broadcast.',
       inputSchema: planDepositSchema,
     },
-    async (args) => {
+    withSafeToolErrors('divigent_plan_deposit', async (args) => {
       const wallet = evmAddress(args.wallet);
       const amount = parseCappedUsdc(args.amountUsdc, runtime);
       const plan = await planningDivigent(runtime, wallet).planDeposit({
@@ -712,7 +922,7 @@ export function buildServer(runtime: Runtime): McpServer {
           : 'Deposit was simulated successfully at current chain state.',
         transaction: compactTransactionFromPlan(plan, runtime.chain),
       });
-    },
+    }),
   );
 
   server.registerTool(
@@ -722,13 +932,13 @@ export function buildServer(runtime: Runtime): McpServer {
         'Plan an unsigned Divigent withdrawal by exact shares or desired net USDC. Does not sign or broadcast.',
       inputSchema: planWithdrawSchema,
     },
-    async (args) => {
+    withSafeToolErrors('divigent_plan_withdraw', async (args) => {
       const wallet = evmAddress(args.wallet);
       if (args.amountUsdc !== undefined && args.shares !== undefined) {
-        throw new Error('Pass either amountUsdc or shares, not both.');
+        throw new SafeToolUserError('Pass either amountUsdc or shares, not both.');
       }
       if (args.amountUsdc === undefined && args.shares === undefined) {
-        throw new Error('Provide one of amountUsdc or shares.');
+        throw new SafeToolUserError('Provide one of amountUsdc or shares.');
       }
 
       const planner = planningDivigent(runtime, wallet);
@@ -739,6 +949,8 @@ export function buildServer(runtime: Runtime): McpServer {
         shares = await divigent.previewWithdrawNet(desiredUsdc, wallet);
       } else {
         shares = BigInt(args.shares as string);
+        const estimatedUsdcOut = await planner.previewRedeem(shares, wallet);
+        assertCappedUsdc(estimatedUsdcOut, runtime, 'shares withdrawal previewUsdcOut');
       }
 
       const plan = await planner.planWithdraw({
@@ -765,11 +977,54 @@ export function buildServer(runtime: Runtime): McpServer {
         simulatedUsdcOutAtomic: plan.simulatedUsdcOut,
         transaction: compactTransactionFromPlan(plan, runtime.chain),
       });
-    },
+    }),
   );
 
-  logger.info('mcp server constructed', { tools: 6 });
+  if (options.log ?? true) logger.info('mcp server constructed', { tools: 6 });
   return server;
+}
+
+type McpServerPool = {
+  acquire: () => McpServer | undefined;
+  release: (server: McpServer) => void;
+  closeAll: () => Promise<void>;
+};
+
+export function createMcpServerPool(
+  runtime: Runtime,
+  size = DEFAULT_HTTP_MAX_CONCURRENT_REQUESTS,
+): McpServerPool {
+  if (
+    !Number.isInteger(size) ||
+    size < 1 ||
+    size > MAX_HTTP_MAX_CONCURRENT_REQUESTS
+  ) {
+    throw new Error(
+      `MCP server pool size must be an integer from 1 to ${MAX_HTTP_MAX_CONCURRENT_REQUESTS}`,
+    );
+  }
+
+  const servers = Array.from({ length: size }, () => buildServer(runtime, { log: false }));
+  const available = [...servers];
+  const leased = new Set<McpServer>();
+
+  return {
+    acquire: () => {
+      const server = available.pop();
+      if (!server) return undefined;
+      leased.add(server);
+      return server;
+    },
+    release: (server) => {
+      if (!leased.delete(server)) return;
+      available.push(server);
+    },
+    closeAll: async () => {
+      await Promise.allSettled(servers.map((server) => server.close()));
+      available.length = 0;
+      leased.clear();
+    },
+  };
 }
 
 async function runStdio(runtime: Runtime): Promise<void> {
@@ -787,7 +1042,11 @@ async function runHttp(runtime: Runtime): Promise<void> {
 
   const port = parsePort(process.env.MCP_PORT ?? String(DEFAULT_HTTP_PORT));
   const host = process.env.MCP_HOST ?? DEFAULT_HTTP_HOST;
-  const httpSecurity = loadHttpSecurityConfig();
+  const httpSecurity = loadHttpSecurityConfig(process.env, host);
+  const maxConcurrentRequests = parseHttpMaxConcurrentRequests(
+    process.env.MCP_HTTP_MAX_CONCURRENT_REQUESTS,
+  );
+  const serverPool = createMcpServerPool(runtime, maxConcurrentRequests);
 
   const httpServer = httpServerModule.createServer(async (req, res) => {
     try {
@@ -840,28 +1099,48 @@ async function runHttp(runtime: Runtime): Promise<void> {
         return;
       }
 
-      const parsedBody = await readJsonBodyWithLimit(req);
-      if (!parsedBody.ok) {
-        res.writeHead(parsedBody.status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: parsedBody.error }));
+      const server = serverPool.acquire();
+      if (!server) {
+        res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+        res.end(JSON.stringify({ error: 'server busy' }));
         return;
       }
 
-      const server = buildServer(runtime);
-      const transportOptions = {
-        sessionIdGenerator: undefined,
-      } as unknown as ConstructorParameters<typeof StreamableHTTPServerTransport>[0];
-      const transport = new StreamableHTTPServerTransport(transportOptions);
-      await server.connect(transport as unknown as Parameters<McpServer['connect']>[0]);
-      await transport.handleRequest(req, res, parsedBody.body);
-      res.on('close', () => {
-        void transport.close();
-        void server.close();
-      });
+      let released = false;
+      const releaseServer = async (): Promise<void> => {
+        if (released) return;
+        released = true;
+        try {
+          await server.close();
+        } catch (err) {
+          logger.warn('mcp pooled server close failed', { err });
+        } finally {
+          serverPool.release(server);
+        }
+      };
+
+      try {
+        const parsedBody = await readJsonBodyWithLimit(req);
+        if (!parsedBody.ok) {
+          res.writeHead(parsedBody.status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: parsedBody.error }));
+          return;
+        }
+
+        const transportOptions = {
+          sessionIdGenerator: undefined,
+        } as unknown as ConstructorParameters<typeof StreamableHTTPServerTransport>[0];
+        const transport = new StreamableHTTPServerTransport(transportOptions);
+        await server.connect(transport as unknown as Parameters<McpServer['connect']>[0]);
+        res.once('close', () => {
+          void releaseServer();
+        });
+        await transport.handleRequest(req, res, parsedBody.body);
+      } finally {
+        await releaseServer();
+      }
     } catch (err) {
-      logger.error('http request failed', {
-        err: err instanceof Error ? err.message : String(err),
-      });
+      logger.error('http request failed', { err });
       if (!res.headersSent) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'internal error' }));
@@ -874,14 +1153,18 @@ async function runHttp(runtime: Runtime): Promise<void> {
       host,
       port,
       auth: httpSecurity.bearerToken ? 'bearer' : 'unsafe-disabled',
+      maxConcurrentRequests,
     });
   });
 
   const shutdown = (signal: string): void => {
     logger.info('shutting down', { signal });
     httpServer.close((err) => {
-      if (err) logger.error('http close error', { err: err.message });
-      process.exit(err ? 1 : 0);
+      void (async () => {
+        await serverPool.closeAll();
+        if (err) logger.error('http close error', { err });
+        process.exit(err ? 1 : 0);
+      })();
     });
     setTimeout(() => process.exit(1), 5_000).unref();
   };

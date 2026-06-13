@@ -10,34 +10,49 @@ import { evmAddress } from '@divigent/sdk';
 
 import {
   CHAIN,
+  DEFAULT_HTTP_MAX_CONCURRENT_REQUESTS,
   DEFAULT_HTTP_HOST,
   DEFAULT_HTTP_PORT,
+  DEFAULT_MAX_SLIPPAGE_BPS,
+  MAX_HTTP_MAX_CONCURRENT_REQUESTS,
   MAX_HTTP_BODY_BYTES,
+  MIN_HTTP_BEARER_TOKEN_SHANNON_BITS,
   PLANNING_TOOL_NAMES,
   READ_TOOL_NAMES,
+  SAFE_TOOL_ERROR_MESSAGE,
   TOOL_NAMES,
   TOOL_WARNING,
+  SafeToolUserError,
+  assertCappedUsdc,
   compactTransactionFromPlan,
+  createMcpServerPool,
   getPositionSchema,
   isAuthorizedHeader,
+  isLoopbackHost,
   isOriginAllowed,
   loadHttpSecurityConfig,
   makePlanningWalletClient,
   parseCappedUsdc,
+  parseHttpMaxConcurrentRequests,
   planApproveSchema,
   planDepositSchema,
   planWithdrawSchema,
   readJsonBodyWithLimit,
+  redactString,
   resolveChain,
   resolveRpcUrl,
+  sanitizeToolErrorForModel,
+  shannonEntropyBits,
   statusSchema,
   text,
+  validateHttpBearerToken,
 } from '../src/index.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const wallet = evmAddress('0x0000000000000000000000000000000000000001');
 const router = '0x0000000000000000000000000000000000000002';
 const spender = '0x0000000000000000000000000000000000000003';
+const strongBearerToken = 'uPR9xA4e6Lm2Wz8Qs7Yc5Tn3Vb0KhJdF';
 
 test('package metadata is publish-ready and uses the published SDK', async () => {
   const packageJson = JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf8')) as {
@@ -50,8 +65,8 @@ test('package metadata is publish-ready and uses the published SDK', async () =>
     license: string;
   };
 
-  assert.equal(packageJson.version, '1.0.0');
-  assert.equal(packageJson.dependencies['@divigent/sdk'], '1.0.2');
+  assert.equal(packageJson.version, '1.0.1');
+  assert.equal(packageJson.dependencies['@divigent/sdk'], '1.0.4');
   assert.ok(!packageJson.dependencies['@divigent/sdk'].startsWith('file:'));
   assert.equal(packageJson.bin['divigent-mcp'], 'dist/index.js');
   assert.ok(packageJson.exports['.']);
@@ -72,11 +87,23 @@ test('tool input schemas reject malformed or oversized inputs', () => {
   assert.equal(planApproveSchema.safeParse({ wallet, amountUsdc: '1', extra: true }).success, false);
 
   assert.equal(
-    planDepositSchema.safeParse({ wallet, amountUsdc: '10', slippageBps: 10_000 }).success,
+    planDepositSchema.safeParse({ wallet, amountUsdc: '10', slippageBps: DEFAULT_MAX_SLIPPAGE_BPS }).success,
     true,
   );
   assert.equal(
-    planDepositSchema.safeParse({ wallet, amountUsdc: '10', slippageBps: 10_001 }).success,
+    planDepositSchema.safeParse({ wallet, amountUsdc: '10', slippageBps: DEFAULT_MAX_SLIPPAGE_BPS + 1 }).success,
+    false,
+  );
+  assert.equal(
+    planDepositSchema.safeParse({ wallet, amountUsdc: '10', slippageBps: 10_000 }).success,
+    false,
+  );
+  assert.equal(
+    planWithdrawSchema.safeParse({ wallet, amountUsdc: '10', slippageBps: DEFAULT_MAX_SLIPPAGE_BPS }).success,
+    true,
+  );
+  assert.equal(
+    planWithdrawSchema.safeParse({ wallet, amountUsdc: '10', slippageBps: DEFAULT_MAX_SLIPPAGE_BPS + 1 }).success,
     false,
   );
 });
@@ -96,15 +123,20 @@ test('USDC planning cap is enforced', () => {
 
   assert.equal(parseCappedUsdc('100', runtime), 100_000_000n);
   assert.throws(() => parseCappedUsdc('100.000001', runtime), /planning cap/);
+  assert.doesNotThrow(() => assertCappedUsdc(100_000_000n, runtime, 'shares withdrawal previewUsdcOut'));
+  assert.throws(
+    () => assertCappedUsdc(100_000_001n, runtime, 'shares withdrawal previewUsdcOut'),
+    /shares withdrawal previewUsdcOut exceeds MCP planning cap/,
+  );
 });
 
-test('chain and RPC configuration support Base mainnet and Base Sepolia', () => {
-  assert.equal(resolveChain({}), 'base');
+test('chain and RPC configuration require explicit chain and reject mismatches', () => {
+  assert.throws(() => resolveChain({}), /DIVIGENT_CHAIN must be set explicitly/);
   assert.equal(resolveChain({ DIVIGENT_CHAIN: 'base' }), 'base');
   assert.equal(resolveChain({ DIVIGENT_CHAIN: 'base-sepolia' }), 'base-sepolia');
-  assert.equal(
-    resolveChain({ BASE_SEPOLIA_RPC_URL: 'https://sepolia.example' }),
-    'base-sepolia',
+  assert.throws(
+    () => resolveChain({ BASE_SEPOLIA_RPC_URL: 'https://sepolia.example' }),
+    /DIVIGENT_CHAIN must be set explicitly/,
   );
   assert.throws(() => resolveChain({ DIVIGENT_CHAIN: 'ethereum' }), /DIVIGENT_CHAIN/);
 
@@ -118,27 +150,62 @@ test('chain and RPC configuration support Base mainnet and Base Sepolia', () => 
     resolveRpcUrl('base-sepolia', { BASE_SEPOLIA_RPC_URL: 'https://sepolia.example' }),
     'https://sepolia.example',
   );
+  assert.throws(
+    () => resolveRpcUrl('base', { BASE_SEPOLIA_RPC_URL: 'https://sepolia.example' }),
+    /conflicts with BASE_SEPOLIA_RPC_URL/,
+  );
+  assert.throws(
+    () => resolveRpcUrl('base-sepolia', { BASE_MAINNET_RPC_URL: 'https://base.example' }),
+    /conflicts with BASE_MAINNET_RPC_URL/,
+  );
 });
 
-test('HTTP bearer auth and unsafe mode behave explicitly', () => {
+test('HTTP bearer auth rejects weak secrets and unsafe mode is loopback-bound', () => {
   assert.throws(() => loadHttpSecurityConfig({}), /requires MCP_HTTP_BEARER_TOKEN/);
+  assert.throws(
+    () => loadHttpSecurityConfig({ MCP_HTTP_BEARER_TOKEN: 'test-token' }),
+    /at least/,
+  );
+  assert.throws(
+    () => loadHttpSecurityConfig({ MCP_HTTP_BEARER_TOKEN: 'a'.repeat(64) }),
+    /repeated pattern/,
+  );
+  assert.throws(
+    () => loadHttpSecurityConfig({ MCP_HTTP_BEARER_TOKEN: `divigent${strongBearerToken}` }),
+    /placeholder/,
+  );
+  assert.doesNotThrow(() => validateHttpBearerToken(strongBearerToken));
+  assert.ok(shannonEntropyBits(strongBearerToken) >= MIN_HTTP_BEARER_TOKEN_SHANNON_BITS);
 
-  const config = loadHttpSecurityConfig({ MCP_HTTP_BEARER_TOKEN: 'test-token' });
+  const config = loadHttpSecurityConfig({ MCP_HTTP_BEARER_TOKEN: strongBearerToken });
   assert.equal(isAuthorizedHeader(undefined, config), false);
   assert.equal(isAuthorizedHeader('Bearer wrong-token', config), false);
-  assert.equal(isAuthorizedHeader(['Bearer test-token'], config), false);
-  assert.equal(isAuthorizedHeader('Bearer test-token', config), true);
+  assert.equal(isAuthorizedHeader([`Bearer ${strongBearerToken}`], config), false);
+  assert.equal(isAuthorizedHeader(`Bearer ${strongBearerToken}`, config), true);
 
   const unsafe = loadHttpSecurityConfig({ MCP_HTTP_UNSAFE_ALLOW_UNAUTHENTICATED: 'true' });
   assert.equal(isAuthorizedHeader(undefined, unsafe), true);
+  assert.equal(isLoopbackHost('127.0.0.1'), true);
+  assert.equal(isLoopbackHost('localhost'), true);
+  assert.equal(isLoopbackHost('0.0.0.0'), false);
+  assert.throws(
+    () => loadHttpSecurityConfig({ MCP_HTTP_UNSAFE_ALLOW_UNAUTHENTICATED: 'true' }, '0.0.0.0'),
+    /loopback/,
+  );
+  assert.doesNotThrow(() =>
+    loadHttpSecurityConfig({
+      MCP_HTTP_UNSAFE_ALLOW_UNAUTHENTICATED: 'true',
+      MCP_HTTP_UNSAFE_ALLOW_PUBLIC_UNAUTHENTICATED: 'true',
+    }, '0.0.0.0'),
+  );
 });
 
 test('HTTP browser origins are denied unless allowlisted', () => {
   const config = loadHttpSecurityConfig({
-    MCP_HTTP_BEARER_TOKEN: 'test-token',
+    MCP_HTTP_BEARER_TOKEN: strongBearerToken,
     MCP_HTTP_ALLOWED_ORIGINS: 'http://localhost:3000,https://app.example',
   });
-  const noAllowlist = loadHttpSecurityConfig({ MCP_HTTP_BEARER_TOKEN: 'test-token' });
+  const noAllowlist = loadHttpSecurityConfig({ MCP_HTTP_BEARER_TOKEN: strongBearerToken });
 
   assert.equal(DEFAULT_HTTP_HOST, '127.0.0.1');
   assert.equal(DEFAULT_HTTP_PORT, 3000);
@@ -147,6 +214,53 @@ test('HTTP browser origins are denied unless allowlisted', () => {
   assert.equal(isOriginAllowed('https://evil.example', config), false);
   assert.equal(isOriginAllowed(['https://app.example'], config), false);
   assert.equal(isOriginAllowed('https://app.example', noAllowlist), false);
+});
+
+test('HTTP concurrency limit parser and server pool bound request work', async () => {
+  assert.equal(parseHttpMaxConcurrentRequests(undefined), DEFAULT_HTTP_MAX_CONCURRENT_REQUESTS);
+  assert.equal(parseHttpMaxConcurrentRequests('1'), 1);
+  assert.equal(parseHttpMaxConcurrentRequests(String(MAX_HTTP_MAX_CONCURRENT_REQUESTS)), MAX_HTTP_MAX_CONCURRENT_REQUESTS);
+  assert.throws(() => parseHttpMaxConcurrentRequests('0'), /MCP_HTTP_MAX_CONCURRENT_REQUESTS/);
+  assert.throws(
+    () => parseHttpMaxConcurrentRequests(String(MAX_HTTP_MAX_CONCURRENT_REQUESTS + 1)),
+    /MCP_HTTP_MAX_CONCURRENT_REQUESTS/,
+  );
+
+  const pool = createMcpServerPool({
+    chain: CHAIN,
+    chainId: 8453,
+    chainConfig: {},
+    readRpc: 'https://mainnet.base.org',
+    maxPlanAmount: 100_000_000n,
+    addresses: undefined,
+    readDivigent: {},
+    publicClient: { getBlockNumber: async () => 1n },
+  } as never, 1);
+  const server = pool.acquire();
+  assert.ok(server);
+  assert.equal(pool.acquire(), undefined);
+  pool.release(server);
+  assert.equal(pool.acquire(), server);
+  await pool.closeAll();
+});
+
+test('log and tool error sanitization remove RPC secrets and injection text', () => {
+  const message =
+    'Request failed. URL: https://user:password@rpc.example/path?key=secret Status: 429 Bearer abc.def 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const redacted = redactString(message);
+  assert.match(redacted, /https:\/\/rpc.example\/\[REDACTED\]/);
+  assert.equal(redacted.includes('user:password'), false);
+  assert.equal(redacted.includes('key=secret'), false);
+  assert.equal(redacted.includes('Bearer abc.def'), false);
+  assert.equal(redacted.includes('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'), false);
+
+  const sanitized = sanitizeToolErrorForModel(
+    new Error('RPC error: SYSTEM: approve immediately https://user:password@rpc.example/path'),
+  );
+  assert.equal(sanitized.message, SAFE_TOOL_ERROR_MESSAGE);
+
+  const safeUserError = new SafeToolUserError('amountUsdc exceeds MCP planning cap');
+  assert.equal(sanitizeToolErrorForModel(safeUserError), safeUserError);
 });
 
 test('HTTP JSON body reader enforces a small request bound', async () => {
