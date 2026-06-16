@@ -665,6 +665,10 @@ export function parseHttpMaxConcurrentRequests(value: string | undefined): numbe
   return parsed;
 }
 
+export function isHealthzRequest(method: string | undefined, pathname: string): boolean {
+  return method === 'GET' && pathname === '/healthz';
+}
+
 type JsonBodyReadResult =
   | { ok: true; body: unknown }
   | { ok: false; status: number; error: string };
@@ -1078,18 +1082,18 @@ async function runHttp(runtime: Runtime): Promise<void> {
         return;
       }
 
+      if (isHealthzRequest(req.method, url.pathname)) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok' }));
+        return;
+      }
+
       if (!isAuthorizedHeader(req.headers.authorization, httpSecurity)) {
         res.writeHead(401, {
           'Content-Type': 'application/json',
           'WWW-Authenticate': 'Bearer realm="divigent-mcp"',
         });
         res.end(JSON.stringify({ error: 'unauthorized' }));
-        return;
-      }
-
-      if (req.method === 'GET' && url.pathname === '/healthz') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok' }));
         return;
       }
 

@@ -244,9 +244,10 @@ npx @divigent/mcp-server
 ```
 
 The server exposes `POST /` and `POST /mcp` for stateless Streamable HTTP and
-`GET /healthz` for liveness. HTTP binds to `127.0.0.1` by default, all routes
+`GET /healthz` for liveness. HTTP binds to `127.0.0.1` by default, MCP routes
 require bearer auth unless unsafe mode is explicitly set, and JSON request
-bodies are capped at 64 KiB. Bearer tokens must be strong; use
+bodies are capped at 64 KiB. `/healthz` returns only `{"status":"ok"}` and is
+intentionally reachable without credentials. Bearer tokens must be strong; use
 `openssl rand -hex 32` to generate one.
 
 Unauthenticated HTTP mode is only accepted on loopback hosts by default. Public
@@ -299,6 +300,7 @@ npm test
   plan amounts and capped slippage.
 - `DIVIGENT_CHAIN` must be explicit; chain/RPC mismatches fail at startup.
 - HTTP transport requires a strong bearer token by default.
+- `/healthz` is unauthenticated and returns only static liveness status.
 - Unauthenticated HTTP mode is loopback-only unless a separate public unsafe
   override is set.
 - Browser origins are denied unless explicitly allowlisted, but CORS is not

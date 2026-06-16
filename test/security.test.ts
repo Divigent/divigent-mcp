@@ -28,6 +28,7 @@ import {
   createMcpServerPool,
   getPositionSchema,
   isAuthorizedHeader,
+  isHealthzRequest,
   isLoopbackHost,
   isOriginAllowed,
   loadHttpSecurityConfig,
@@ -214,6 +215,19 @@ test('HTTP browser origins are denied unless allowlisted', () => {
   assert.equal(isOriginAllowed('https://evil.example', config), false);
   assert.equal(isOriginAllowed(['https://app.example'], config), false);
   assert.equal(isOriginAllowed('https://app.example', noAllowlist), false);
+});
+
+test('/healthz is served before bearer authentication', async () => {
+  assert.equal(isHealthzRequest('GET', '/healthz'), true);
+  assert.equal(isHealthzRequest('POST', '/healthz'), false);
+  assert.equal(isHealthzRequest('GET', '/mcp'), false);
+
+  const source = await readFile(join(repoRoot, 'src/index.ts'), 'utf8');
+  const healthzIndex = source.indexOf('isHealthzRequest(req.method, url.pathname)');
+  const authIndex = source.indexOf('isAuthorizedHeader(req.headers.authorization, httpSecurity)');
+  assert.ok(healthzIndex >= 0, 'missing healthz dispatch');
+  assert.ok(authIndex >= 0, 'missing bearer auth dispatch');
+  assert.ok(healthzIndex < authIndex, '/healthz must be dispatched before bearer auth');
 });
 
 test('HTTP concurrency limit parser and server pool bound request work', async () => {
